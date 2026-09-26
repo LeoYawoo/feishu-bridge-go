@@ -1,107 +1,118 @@
 package bridge
 
 import (
-	"fmt"
+	"path/filepath"
 	"strings"
-	"time"
 
 	"feishubridge/internal/card"
 	"feishubridge/internal/config"
-	"feishubridge/internal/feishu"
 )
 
 // isBridgeCommand reports whether text starts with a known bridge command.
 // Only exact first-token matches are treated as commands, so that a user
 // typed message like "/tmp/foo" is never swallowed.
+//
+// The redesign (docs/design-session-and-test.md §3.3) collapses the command
+// surface to a single entry point: /new. Main chat is a strict console,
+// topics are pure claude conversations. Anything else the user types falls
+// through to the agent.
 func isBridgeCommand(text string) bool {
 	t := strings.ToLower(strings.TrimSpace(text))
 	first := strings.Fields(t)
 	if len(first) == 0 {
 		return false
 	}
-	switch first[0] {
-	case "/help", "/h", "/new", "/reset", "/stop", "/cancel",
-		"/status", "/pwd", "/cd", "/ls", "/model":
-		return true
-	}
-	return false
+	return first[0] == "/new"
 }
 
-// helpText is the /help body.
-const helpText = `**会话控制**
-- /new — 开启新的 Claude 会话（保留目录）
-- /stop — 取消当前任务
-- /status — 查看 shell、会话与运行时间
-- /model [名称] — 查看或切换模型
+// parseNewArgs splits "/new <cwd?>" into the raw cwd argument. Empty string
+// when no argument was supplied. Not normalised here; the caller resolves
+// relative paths and validates existence.
+func parseNewArgs(text string) string {
+	fields := strings.Fields(text)
+	if len(fields) < 2 {
+		return ""
+	}
+	// Rejoin in case the cwd contains spaces; the cwd arg is everything
+	// after the first token.
+	rest := strings.TrimSpace(text[len(fields[0]):])
+	return rest
+}
 
-**目录**（本进程内记录，无需外部 shell）
-- /pwd — 当前工作目录
-- /cd <路径> — 切换目录（相对路径基于当前目录）
-- /ls — 列出文件
-
-**其他**
-- /help — 本帮助
-
-其他任意消息都会作为提示词发送给 Claude。
-/cd 切换的目录对后续命令和 Claude 会话都生效；它只记录在本进程内存里，重启后回到默认工作目录。`
-
-// standardButtons returns the action buttons appended to most cards.
+// recentDirButtons renders the console card's "recent directories" button
+// set. Each button's Value stamps action="new_topic" and the full cwd, so
+// clicking it is equivalent to typing "/new <cwd>" in the main chat.
 //
-// A card already sitting inside a topic must not offer "new session": a new
-// session is materialised as a new topic, so offering it again would fork the
-// conversation. The topic-scoped set keeps only actions that make sense in
-// place.
+// Basename is used for display; the full path is preserved in Value so the
+// callback can resolve to the exact directory without ambiguity (two cwds
+// can share a basename).
 //
-// The root message id is stamped into every topic button. The callback only
-// carries the clicked card's own id, and reply_in_thread=true forks a topic
-// only when the anchor is not itself inside one - so a reply to a card that
-// is already a topic reply would leave the topic entirely. Anchoring on the
-// root keeps every follow-up inside it.
-func standardButtons(bot *config.BotConfig, m *feishu.Message) []card.Button {
-	if m != nil && m.ThreadID != "" {
-		return threadButtons(m.ThreadID, m.RootID)
+// Up to recentDirsMax buttons. The "(最近)" suffix on the first entry is a
+// UX affordance: when the user just wants to continue where they left off,
+// the most-recent row is what they'll click.
+func recentDirButtons(bot *config.BotConfig, cwds []string) []card.Button {
+	if len(cwds) == 0 {
+		return nil
 	}
-	return chatButtons()
+	out := make([]card.Button, 0, len(cwds))
+	for i, cwd := range cwds {
+		label := filepath.Base(cwd)
+		if label == "." || label == "" {
+			label = cwd
+		}
+		if i == 0 {
+			label += " (最近)"
+		}
+		out = append(out, card.Button{
+			Text: "🆕 " + label,
+			Value: map[string]string{
+				"action": "new_topic",
+				"cwd":    cwd,
+			},
+		})
+	}
+	return out
 }
 
-// chatButtons is the set offered outside a topic, where forking a topic is
-// the point.
-func chatButtons() []card.Button {
-	return []card.Button{
-		{Text: "🆕 新会话", Value: map[string]string{"action": "new"}},
-		{Text: "⏹ 停止", Value: map[string]string{"action": "stop"}},
-		{Text: "📊 状态", Value: map[string]string{"action": "status"}},
-		{Text: "❓ 帮助", Value: map[string]string{"action": "help"}},
-	}
-}
-
-// threadButtons is the set offered inside an existing topic.
-func threadButtons(thread, root string) []card.Button {
-	v := func(a string) map[string]string {
-		return map[string]string{"action": a, "thread": thread, "root": root}
-	}
-	return []card.Button{
-		{Text: "⏹ 停止", Value: v("stop")},
-		{Text: "📊 状态", Value: v("status")},
-		{Text: "❓ 帮助", Value: v("help")},
-	}
-}
-
-// threadContext renders the per-topic scope: which directory the agent runs
-// in, and which Claude session this topic is bound to.
+// topicRootButtons renders the topic-root card's session-picker buttons.
+// Up to 5 history sessions (most-recent-first) plus a "🆕 新" button.
 //
-// The session id is the only durable handle on a conversation. Showing it
-// lets the user cross-check this topic against a local `claude --resume`
-// session, so a mismatch is diagnosable instead of mysterious.
-func threadContext(s *session, workspace string) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("**工作目录**: `%s`\n\n", workspace))
-	if s != nil {
-		sb.WriteString(fmt.Sprintf("**Claude 会话**: `%s`\n\n", shortID(string(s.ID))))
-		sb.WriteString(fmt.Sprintf("已处理 %d 轮 · 最后活动 %s 前\n",
-			s.Turns, time.Since(s.LastSeen).Round(time.Second)))
-	} else {
-		sb.WriteString("尚未运行会话 — 本话题下一条消息会创建 Claude 会话。\n")
+// History session buttons stamp action="resume_session" plus the topic's
+// thread and root message ids (which must survive the callback round-trip;
+// the callback's Context only carries the clicked card's own id). The
+// pendingSessions map in Bridge is keyed on threadID, so the same thread
+// root can be offered on any of its history sessions.
+//
+// The "🆕 新" button stamps action="new_session"; clicking it clears any
+// pending resume for this thread, so the next plain message starts a fresh
+// session.
+func topicRootButtons(bot *config.BotConfig, thread, root string, sessions []*session) []card.Button {
+	maxHistory := 5
+	if len(sessions) > maxHistory {
+		sessions = sessions[:maxHistory]
 	}
-	return sb.String()
+	out := make([]card.Button, 0, len(sessions)+1)
+	for _, se := range sessions {
+		if se == nil || se.ID == "" {
+			continue
+		}
+		out = append(out, card.Button{
+			Text: "▶ " + shortID(string(se.ID)),
+			Value: map[string]string{
+				"action":  "resume_session",
+				"thread":  thread,
+				"root":    root,
+				"session": string(se.ID),
+			},
+		})
+	}
+	out = append(out, card.Button{
+		Text: "🆕 新",
+		Value: map[string]string{
+			"action": "new_session",
+			"thread": thread,
+			"root":   root,
+		},
+	})
+	return out
 }

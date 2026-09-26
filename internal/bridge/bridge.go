@@ -55,21 +55,43 @@ type Bridge struct {
 	cli feishuSender
 	log *log.Logger
 
-	// cwds is keyed by (botID, chatID): the directory the user has /cd'd to.
-	// dirs and sessions are keyed the same way.
-	mu         sync.Mutex
-	cwds       map[string]string
+	// store is the session table. session.Cwd is the authoritative cwd
+	// for a topic (there is no separate b.cwds map anymore).
 	store      *sessionStore
 	sessReaper *reaper
 	// recentDirs is the bot-level LRU of recently opened cwds, persisted
-	// next to the session table. The console card reads it (step 9); newTopic
-	// pushes into it now so the LRU is populated as soon as /new lands.
+	// next to the session table. newTopic pushes into it so the console
+	// card's "recent directories" buttons can list it.
 	recentDirs *recentDirsStore
 	// runAgent is the entry point into the claude subprocess. Production
 	// uses realAgentRunner; tests can swap in a stub that never shells out.
 	runAgent agentRunner
-	// inflight tracks turns currently running, so /stop can cancel them.
+	// inflight tracks turns currently running so /stop-equivalent flows can
+	// cancel them. Retained for future use; the redesign drops the /stop
+	// command but keeping the field means context cancellation at shutdown
+	// can still be plumbed in later.
+	//
+	// mu protects inflight (and the reaper's snapshot of it, if any).
+	// It is deliberately not sessionStore's lock — the store has its own,
+	// and cross-locking them invites the exact deadlock CLAUDE.md §6 warns
+	// about.
+	mu       sync.Mutex
 	inflight map[string]*turn
+	// pendingSessions maps threadID -> resume session id. When the user
+	// clicks a "▶ <session>" button on a topic's root card, this slot is
+	// filled. The next plain message in that topic consumes it: the agent
+	// is invoked with --resume <id>. Cleared after consumption so a stale
+	// click doesn't re-resume an old session.
+	//
+	// Deliberately not persisted: a restart means pending state is lost,
+	// and the user just starts a new session on the next message. Cheaper
+	// than serialising ephemeral intent.
+	//
+	// Guarded by pendingMu. Kept separate from store's lock because the
+	// consumption path (runTurn) holds store's lock while reading and
+	// would otherwise risk re-entrancy if pendingSessions lived there.
+	pendingMu       sync.Mutex
+	pendingSessions map[string]string
 
 	startedAt time.Time
 }
@@ -107,12 +129,12 @@ func New(cfg *config.Config, cli *feishu.Client, logger *log.Logger) *Bridge {
 		logger = log.Default()
 	}
 	b := &Bridge{
-		cfg:      cfg,
-		cli:      cli,
-		log:      logger,
-		cwds:     make(map[string]string),
-		inflight: make(map[string]*turn),
-		runAgent: realAgentRunner{},
+		cfg:             cfg,
+		cli:             cli,
+		log:             logger,
+		inflight:        make(map[string]*turn),
+		pendingSessions: make(map[string]string),
+		runAgent:        realAgentRunner{},
 	}
 	b.store = newSessionStore(cfg.Bots[0].Workspace, logger.Printf)
 	b.sessReaper = newReaper(cfg.Stream.SessionIdleSec, logger.Printf)
@@ -192,194 +214,89 @@ func (b *Bridge) onMessage(ctx context.Context, m *feishu.Message) error {
 		}
 	}
 
-	// Commands are handled synchronously; everything else is a turn.
+	// Main chat is a strict console: /new is the only accepted command, and
+	// plain text never reaches claude from here — it just gets a console
+	// card back. Topics are pure claude conversations: anything that isn't
+	// /new (there is only one, and there isn't one, in a topic) is a turn.
 	if isBridgeCommand(text) {
 		return b.handleCommand(ctx, bot, m, text)
+	}
+	if m.ThreadID == "" {
+		// Main chat, plain text: not a command, not a turn. Reply with the
+		// console card so the user sees the recent-directory shortcuts.
+		return b.replyConsoleCard(ctx, bot, m)
 	}
 	return b.runTurn(ctx, bot, m, text)
 }
 
 // ---- command routing -----------------------------------------------------
+//
+// There is exactly one command: /new [cwd?]. See docs/design-session-and-test.md
+// §3.3 for the reasoning — the console is a thin launcher, and everything
+// else (interrupting, status, help, session management) belongs to the claude
+// conversation in a topic or to the card buttons.
 
 func (b *Bridge) handleCommand(ctx context.Context, bot *config.BotConfig, m *feishu.Message, text string) error {
-	fields := strings.Fields(text)
-	cmd := strings.ToLower(fields[0])
-	rest := ""
-	if len(fields) > 1 {
-		rest = strings.TrimSpace(text[len(fields[0]):])
-	}
-
-	switch cmd {
-	case "/help", "/h":
-		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "命令列表", helpText, standardButtons(bot, m)...))
-	case "/pwd":
-		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "目录",
-			fmt.Sprintf("```\n%s\n```\n\n后续 /ls 与 Claude 会话都以此为工作目录。",
-				b.currentCwd(bot, m)), standardButtons(bot, m)...))
-	case "/cd":
-		if rest == "" {
-			return b.replyCard(ctx, m, card.Error(bot.DisplayName, "用法: /cd <路径>"))
-		}
-		if _, err := b.chdir(bot, m, rest); err != nil {
-			return b.replyCard(ctx, m, card.Error(bot.DisplayName, fmt.Sprintf("```\n%v\n```", err)))
-		}
-		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "已切换目录",
-			fmt.Sprintf("```\n%s\n```\n\n后续 /ls 与 Claude 会话都以此为工作目录。",
-				b.currentCwd(bot, m)), standardButtons(bot, m)...))
-	case "/ls":
-		out, err := b.listDir(bot, m)
-		if err != nil {
-			return b.replyCard(ctx, m, card.Error(bot.DisplayName, fmt.Sprintf("```\n%v\n```", err)))
-		}
-		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, b.currentCwd(bot, m),
-			"```\n"+out+"\n```", standardButtons(bot, m)...))
-	case "/new", "/reset":
-		return b.newTopic(ctx, bot, m)
-	case "/stop", "/cancel":
-		if !b.stopCurrent(bot.ID, m.ChatID, m.ThreadID) {
-			// Nothing running: a "已停止" reply would claim an action that did
-			// not happen, and the card the user clicked already shows the
-			// result. Silent is the honest answer here.
-			return nil
-		}
-		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "已停止", "已请求取消当前任务。"))
-	case "/status":
-		return b.handleStatus(ctx, bot, m)
-	case "/model":
-		if rest == "" {
-			model := b.cfg.Agent.Model
-			return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "模型", fmt.Sprintf("当前: `%s`（留空则用默认）", orDefault(model, "默认"))))
-		}
-		b.cfg.Agent.Model = rest
-		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "模型已切换", fmt.Sprintf("当前模型: `%s`\n\n下次会话生效。", rest)))
-	default:
-		// Unknown commands fall through to the agent. This mirrors the
-		// reference project, which only exact-matches known commands.
-		return b.runTurn(ctx, bot, m, text)
-	}
+	// isBridgeCommand already gated on first token being /new, so the
+	// argument is everything after "/new ". Empty means "use most recent".
+	cwd := parseNewArgs(text)
+	return b.newTopic(ctx, bot, m, cwd)
 }
 
-// ---- directory layer -----------------------------------------------------
-//
-// The working directory is the only per-chat mutable state. It is a plain
-// string in a map, so there is no process to start, stop, snapshot or reap,
-// and /cd survives a bridge restart for the lifetime of the process.
-
-// cwdKey joins bot and chat into the key used for the cwd table.
-func cwdKey(botID, chatID string) string { return botID + "/" + chatID }
-
-// topicCwdKey is cwdKey plus the topic. The working directory is per topic,
-// not per chat: a topic is the user's unit of work, and "new session" must
-// inherit the directory the user was working in rather than resetting to the
-// bot's default workspace.
-func topicCwdKey(botID, chatID, threadID string) string {
-	if threadID == "" {
-		return cwdKey(botID, chatID)
-	}
-	return botID + "/" + chatID + "/" + threadID
+// replyConsoleCard is the main-chat response to non-command text. The
+// redesign's central insight is that plain text in the main chat should
+// never reach claude — it's noise, and the user almost certainly wanted
+// to open a topic. Show the console card with recent-directory buttons.
+func (b *Bridge) replyConsoleCard(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
+	cwds := b.recentDirs.List(bot.ID)
+	btns := recentDirButtons(bot, cwds)
+	body := "**这里是会话管理控制台,不启动 claude。**\n\n**最近目录**(点击=用该 cwd 开新话题):"
+	return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "⚠️ 主会话是控制台", body, btns...))
 }
 
-// currentCwd returns the topic's working directory, falling back to the bot's
-// configured workspace when nothing has been recorded.
+// currentCwd returns the cwd the agent should run in for this message's
+// topic. Precedence:
+//  1. pendingSessions[thread] is not consulted here — that's a session id,
+//     not a cwd.
+//  2. The topic's session record, if any. session.Cwd is written by
+//     runTurn on the first turn and is authoritative thereafter.
+//  3. Fall back to the bot's configured workspace. This is only reached for
+//     brand-new topics with no session yet (immediately after /new).
 func (b *Bridge) currentCwd(bot *config.BotConfig, m *feishu.Message) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if d, ok := b.cwds[topicCwdKey(bot.ID, m.ChatID, m.ThreadID)]; ok && d != "" {
-		return d
+	if m.ThreadID != "" {
+		if s := b.store.Get(bot.ID, m.ChatID, m.ThreadID); s != nil && s.Cwd != "" {
+			return s.Cwd
+		}
 	}
 	return bot.Workspace
 }
 
-// chdir resolves the target and records it as the topic's working directory.
-// Only existing directories are accepted, so /cd into a typo cannot silently
-// strand later /ls calls.
-func (b *Bridge) chdir(bot *config.BotConfig, m *feishu.Message, target string) (string, error) {
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(b.currentCwd(bot, m), target)
-	}
-	info, err := os.Stat(target)
-	if err != nil {
-		return "", fmt.Errorf("路径不存在: %s", target)
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("不是目录: %s", target)
-	}
-	b.mu.Lock()
-	b.cwds[topicCwdKey(bot.ID, m.ChatID, m.ThreadID)] = target
-	b.mu.Unlock()
-	return target, nil
-}
-
-// listDir renders the chat's working directory. Output is capped so a huge
-// directory cannot blow past the card size limit.
-func (b *Bridge) listDir(bot *config.BotConfig, m *feishu.Message) (string, error) {
-	dir := b.currentCwd(bot, m)
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return "", err
-	}
-	const maxLines = 150
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%-5s %12s  %s\n", "DRW", "SIZE", "NAME"))
-	for i, e := range ents {
-		if i >= maxLines {
-			sb.WriteString(fmt.Sprintf("… 还有 %d 项\n", len(ents)-maxLines))
-			break
-		}
-		size := ""
-		if !e.IsDir() {
-			if fi, err := e.Info(); err == nil {
-				size = fmt.Sprintf("%d", fi.Size())
-			}
-		}
-		name := e.Name()
-		if e.IsDir() {
-			name += "/"
-		}
-		perm := ""
-		if e.Type().IsDir() {
-			perm = "d"
-		}
-		sb.WriteString(fmt.Sprintf("  %s %12s  %s\n", perm, size, name))
-	}
-	return sb.String(), nil
-}
-
-func (b *Bridge) handleStatus(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
-	dir := b.currentCwd(bot, m)
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	var sb strings.Builder
-	// Inside a topic the scope lines are redundant with the topic card's
-	// own context block, so only a chat-wide reply repeats them.
-	if m.ThreadID == "" {
-		sb.WriteString(fmt.Sprintf("**运行时间**: %s\n\n", time.Since(b.startedAt).Round(time.Second)))
-		sb.WriteString(fmt.Sprintf("**工作目录**: `%s`\n\n", dir))
-	}
-
-	if s := b.store.Get(bot.ID, m.ChatID, m.ThreadID); s != nil {
-		if m.ThreadID != "" {
-			sb.WriteString(fmt.Sprintf("**Claude 会话**: `%s`\n\n", shortID(string(s.ID))))
-			sb.WriteString(fmt.Sprintf("已处理 %d 轮 · 最后活动 %s 前\n",
-				s.Turns, time.Since(s.LastSeen).Round(time.Second)))
-		} else {
-			sb.WriteString(fmt.Sprintf("**Claude 会话**: %s\n", shortID(string(s.ID))))
-			sb.WriteString(fmt.Sprintf("**已处理轮次**: %d\n", s.Turns))
-			sb.WriteString(fmt.Sprintf("**最后活动**: %s 前\n", time.Since(s.LastSeen).Round(time.Second)))
-		}
-		if b.sessReaper.cutoff() > 0 {
-			sb.WriteString(fmt.Sprintf("（闲置 %s 后丢弃，不影响 Claude 本地记录）\n", b.sessReaper.cutoff()))
-		}
-	} else {
-		sb.WriteString("**Claude 会话**: 尚无会话\n")
-	}
-	sb.WriteString(fmt.Sprintf("**总会话数**: %d\n", b.store.Count()))
-	return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "状态", sb.String(), standardButtons(bot, m)...))
-}
-
 // ---- the turn ------------------------------------------------------------
+
+// takePendingSession returns the thread's pending resume id and clears the
+// slot. Called at the top of runTurn so a "▶ <session>" click affects
+// exactly the next turn, then falls back to the topic's current session
+// thereafter.
+func (b *Bridge) takePendingSession(threadID string) string {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	id := b.pendingSessions[threadID]
+	delete(b.pendingSessions, threadID)
+	return id
+}
+
+// setPendingSession records which session the next message in this topic
+// should resume. Empty string clears the slot (equivalent to clicking
+// "🆕 新").
+func (b *Bridge) setPendingSession(threadID, sessionID string) {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	if sessionID == "" {
+		delete(b.pendingSessions, threadID)
+		return
+	}
+	b.pendingSessions[threadID] = sessionID
+}
 
 func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.Message, text string) error {
 	// Show the thinking card immediately.
@@ -390,11 +307,24 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 
 	// Resolve or create the Claude session for this thread. The store is
 	// self-locking; it also holds the persistent session_id mapping.
+	//
+	// Priority for the resume target:
+	//  1. A pending resume set by a click on a "▶ <session>" button in
+	//     this topic's root card. Consumed once, then cleared, so the
+	//     click affects exactly one turn.
+	//  2. The topic's existing session (multi-turn continuation).
+	//  3. Empty string: fresh session.
 	sessionKey := sessionKey(bot.ID, m.ChatID, m.ThreadID)
-	s := b.store.Get(bot.ID, m.ChatID, m.ThreadID)
 	resume := ""
-	if s != nil {
-		resume = string(s.ID)
+	if m.ThreadID != "" {
+		if p := b.takePendingSession(m.ThreadID); p != "" {
+			resume = p
+		}
+	}
+	if resume == "" {
+		if s := b.store.Get(bot.ID, m.ChatID, m.ThreadID); s != nil && s.ID != "" {
+			resume = string(s.ID)
+		}
 	}
 
 	// The agent inherits the user's cwd so it lands where /cd left the user,
@@ -513,8 +443,11 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 			shortID(string(res.SessionID)), workspace)
 	}
 
+	// The reply card carries no buttons: session management lives on the
+	// topic-root card, not on every reply. See docs/design-session-and-test.md
+	// §3.2.2.
 	footer := card.FormatUsage(res.Usage, res.ModelUsage, res.CostUSD, elapsed)
-	final := card.Done(bot.DisplayName, body, footer, standardButtons(bot, m)...)
+	final := card.Done(bot.DisplayName, body, footer)
 	b.patchOrSend(ctx, m, msgID, final)
 	return nil
 }
@@ -555,7 +488,12 @@ func (b *Bridge) sendReject(ctx context.Context, chatID, messageID string) {
 // that kept the old topic would be invisible, since every card in it still
 // shows the old thread. Posting a message with reply_in_thread=true creates a
 // topic whose root is that message, so replies afterwards land there.
-func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
+//
+// The optional cwd argument lets /new take a target directory. Empty cwd
+// means "use the most recently used directory" (bot-level LRU). When both
+// cwd is empty and the LRU is empty, fall back to the bot's configured
+// workspace.
+func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.Message, cwd string) error {
 	// m.MessageID is the topic's root when the click came from inside a topic,
 	// and the clicked card otherwise. Either is a valid anchor: reply
 	// reply_in_thread=true forks a topic only when the anchor is not already
@@ -565,24 +503,20 @@ func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.
 		return nil
 	}
 
-	had := b.resetSession(bot.ID, m.ChatID, m.ThreadID)
-
-	// Capture the cwd before the reply: the new topic has no record yet, so
-	// this is the only chance to inherit the directory the user was working
-	// in. Otherwise a topic fork would silently drop back to the bot's
-	// default workspace.
-	inherit := b.currentCwd(bot, m)
-	b.log.Printf("new topic: anchor=%s root=%s thread=%s cwd=%s cleared=%v",
-		shortID(m.MessageID), shortID(m.RootID), shortID(m.ThreadID), inherit, had)
+	// Resolve the target cwd. Precedence: explicit arg > most-recent LRU >
+	// bot's configured workspace. Relative paths are joined against the
+	// bot's workspace; only real, existing directories are accepted, so a
+	// typo in /new cannot silently strand later agent runs.
+	target, err := b.resolveCwd(bot, cwd)
+	if err != nil {
+		return b.replyCard(ctx, m, card.Error(bot.DisplayName, err.Error()))
+	}
 
 	// The notice carries the new topic's identity, but the topic has not been
 	// created yet, so it is built with no buttons and updated once Feishu
 	// returns a thread_id.
-	body := "🆕 新会话已开启。在这个话题里继续，就是一条全新的 Claude 会话。"
-	if !had {
-		body = "本话题已开启新会话，下一条消息从头开始。"
-	}
-	c := card.CommandCard(bot.DisplayName, "新会话", body)
+	body := fmt.Sprintf("cwd: `%s`\n\n点击历史 session 续它,或点 [🆕 新] 从头开始:", target)
+	c := card.CommandCard(bot.DisplayName, "🟢 新话题已开启", body)
 
 	msgID, threadID, err := b.cli.ReplyCardThreaded(ctx, m.MessageID, c, true)
 	if err != nil {
@@ -590,51 +524,72 @@ func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.
 		if m.ThreadID == "" {
 			// No topic to fork: a plain reply is correct here.
 			return b.replyCard(ctx, m,
-				card.CommandCard(bot.DisplayName, "新会话", body, chatButtons()...))
+				card.CommandCard(bot.DisplayName, "🟢 新话题已开启", body,
+					recentDirButtons(bot, b.recentDirs.List(bot.ID))...))
 		}
 		return nil
 	}
 
-	// Now that the topic exists, show what it is bound to. The notice card
-	// is the topic's root, so it gets the topic-scoped button set.
-	b.setCwd(bot.ID, m.ChatID, threadID, inherit)
-	// Promote this cwd in the bot-level LRU so a future no-arg /new and the
-	// console card can find it. Only after the topic is real: an inherited
-	// cwd that never materialises into a topic is not "recently used".
-	b.recentDirs.Add(bot.ID, inherit)
+	// Topic is real. Promote its cwd into the bot-level LRU so a future
+	// no-arg /new and the console card can find it. Only after the topic
+	// is real: an inherited cwd that never materialises into a topic is
+	// not "recently used".
+	b.recentDirs.Add(bot.ID, target)
 
-	notice := card.CommandCard(bot.DisplayName, "新会话",
-		body+"\n\n"+threadContext(nil, inherit), threadButtons(threadID, msgID)...)
+	// The notice is now the topic's root card. Attach session-picker buttons:
+	// up to 5 history sessions (from the byCwd index) plus [🆕 新]. Both
+	// thread and root ids are stamped on every button because the callback
+	// only carries the clicked card's own id — see CLAUDE.md §1.
+	history := b.store.SessionsForCwd(target, 5)
+	notice := card.CommandCard(bot.DisplayName, "🟢 新话题已开启", body,
+		topicRootButtons(bot, threadID, msgID, history)...)
 	if perr := b.cli.PatchCard(ctx, msgID, notice); perr != nil {
 		b.log.Printf("new topic: patch notice: %v", perr)
 	} else {
 		b.log.Printf("new topic: notice patched %s with %d buttons", shortID(msgID), len(notice))
 	}
 
-	b.log.Printf("new topic: %s in chat %s cwd=%s cleared=%v",
-		shortID(threadID), shortKey(m.ChatID), inherit, had)
+	// No session record is created here. The first plain message in the
+	// topic will create one (with session.Cwd = target) via runTurn. That
+	// keeps "topic exists but no claude run yet" a distinct, valid state —
+	// the user may click a history session button before sending anything.
+	b.log.Printf("new topic: %s in chat %s cwd=%s history=%d",
+		shortID(threadID), shortKey(m.ChatID), target, len(history))
 	return nil
 }
 
-// setCwd records a working directory for one topic.
-func (b *Bridge) setCwd(botID, chatID, threadID, dir string) {
-	b.mu.Lock()
-	b.cwds[topicCwdKey(botID, chatID, threadID)] = dir
-	b.mu.Unlock()
-}
-
-// resetSession drops the thread's session record and reports whether there
-// was one to drop, so a reply can say whether it actually cleared anything.
-func (b *Bridge) resetSession(botID, chatID, threadID string) bool {
-	had := b.store.Get(botID, chatID, threadID) != nil
-	b.store.Delete(botID, chatID, threadID)
-	b.store.Save()
-	return had
+// resolveCwd validates and normalises the target directory for a /new.
+// Empty input means "use most recent LRU entry, or bot.Workspace if empty".
+// Relative paths are joined against bot.Workspace; only real directories
+// pass.
+func (b *Bridge) resolveCwd(bot *config.BotConfig, cwd string) (string, error) {
+	if cwd == "" {
+		if r := b.recentDirs.MostRecent(bot.ID); r != "" {
+			cwd = r
+		} else {
+			cwd = bot.Workspace
+		}
+	}
+	if !filepath.IsAbs(cwd) {
+		cwd = filepath.Join(bot.Workspace, cwd)
+	}
+	info, err := os.Stat(cwd)
+	if err != nil {
+		return "", fmt.Errorf("路径不存在: %s", cwd)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("不是目录: %s", cwd)
+	}
+	return cwd, nil
 }
 
 // stopCurrent cancels the in-flight turn for this thread. It reports whether
 // anything was running so the caller does not claim to have stopped a task
 // that was not started.
+//
+// Kept even though no command currently calls it: the redesign drops /stop
+// but context cancellation at shutdown (or a future /cancel-equivalent)
+// still needs this entry point. Delete only if inflight is retired.
 func (b *Bridge) stopCurrent(botID, chatID, threadID string) bool {
 	key := sessionKey(botID, chatID, threadID)
 	b.mu.Lock()
@@ -730,9 +685,12 @@ func (b *Bridge) onCardAction(ctx context.Context, req *feishu.CardAction) (*fei
 
 	// The callback carries only the clicked card's message id. The builder
 	// stamps the topic's thread id and root message id into the button value,
-	// because neither survives the round trip.
+	// because neither survives the round trip. Same story for cwd (stamped
+	// on recentDirButtons) and session (stamped on topicRootButtons).
 	thread := val(req.Action, "thread")
 	root := val(req.Action, "root")
+	cwd := val(req.Action, "cwd")
+	sessionID := val(req.Action, "session")
 	if root == "" {
 		// Older cards predate the root stamp; the clicked card is the best
 		// available anchor.
@@ -757,20 +715,38 @@ func (b *Bridge) onCardAction(ctx context.Context, req *feishu.CardAction) (*fei
 	msg.ParentID = root
 	msg.RootID = root
 
-	// No Toast here: handleCommand already replies with a card, so a second
-	// piece of feedback for the same click would be noise.
-	b.log.Printf("card action %q from %s (chat=%s)", action, shortID(req.Operator), shortKey(req.ChatID))
+	b.log.Printf("card action %q from %s (chat=%s thread=%s cwd=%q session=%q)",
+		action, shortID(req.Operator), shortKey(req.ChatID), shortID(thread), cwd, shortID(sessionID))
 	switch action {
-	case "", "help":
-		return &feishu.CardResponse{}, b.handleCommand(ctx, bot, msg, "/help")
-	case "new":
-		return &feishu.CardResponse{}, b.handleCommand(ctx, bot, msg, "/new")
-	case "stop":
-		return &feishu.CardResponse{}, b.handleCommand(ctx, bot, msg, "/stop")
-	case "status":
-		return &feishu.CardResponse{}, b.handleCommand(ctx, bot, msg, "/status")
+	case "new_topic":
+		// Recent-directory button on the console card. Click = /new <cwd>.
+		// No reply card; newTopic itself posts the topic-root notice.
+		return &feishu.CardResponse{}, b.newTopic(ctx, bot, msg, cwd)
+	case "resume_session":
+		// History-session button on a topic-root card. Sets the pending
+		// resume; the next plain message in this thread consumes it. Silent
+		// acknowledgement so we don't spam the topic.
+		if thread == "" {
+			b.log.Printf("resume_session action without thread; ignoring")
+			return &feishu.CardResponse{}, nil
+		}
+		b.setPendingSession(thread, sessionID)
+		return &feishu.CardResponse{}, nil
+	case "new_session":
+		// [🆕 新] button on a topic-root card. Clears any pending resume
+		// for this thread so the next plain message starts a fresh session.
+		if thread == "" {
+			b.log.Printf("new_session action without thread; ignoring")
+			return &feishu.CardResponse{}, nil
+		}
+		b.setPendingSession(thread, "")
+		return &feishu.CardResponse{}, nil
 	default:
-		b.log.Printf("unknown card action %q", action)
+		// Legacy actions (help / new / stop / status) from older cards that
+		// may still be sitting in a conversation. Silently ignored: the
+		// redesign removed those commands, and answering here would
+		// resurrect the old UX.
+		b.log.Printf("unknown card action %q (legacy card)", action)
 		return nil, nil
 	}
 }

@@ -28,9 +28,6 @@ jobs:
   test:
     name: test / go ${{ matrix.go }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # Windows runners default to pwsh; these steps are bash. Bash is installed
-    # on both runners, so pin it rather than rewriting the scripts per-OS.
-    shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +41,12 @@ jobs:
           go-version: ${{ matrix.go }}
           cache: true
 
+      # Windows runners default to pwsh, which cannot parse bash syntax such
+      # as "if [ -n "$var" ]". Bash is preinstalled on both ubuntu- and
+      # windows- runners, so pin it per step rather than rewriting the scripts
+      # per-OS. `shell` is a step property, not a job property.
       - name: Verify gofmt
+        shell: bash
         run: |
           unformatted="$(gofmt -l ./cmd ./internal)"
           if [ -n "$unformatted" ]; then
@@ -54,17 +56,21 @@ jobs:
           fi
 
       - name: Tidy check
+        shell: bash
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
       - name: Vet
+        shell: bash
         run: go vet ./...
 
       - name: Test
+        shell: bash
         run: go test ./...
 
       - name: Build (host)
+        shell: bash
         run: make build
 
   # ---- 2. release: full matrix + GitHub Release -------------------------

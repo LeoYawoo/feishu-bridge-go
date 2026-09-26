@@ -297,24 +297,34 @@ func (b *Bridge) handleStatus(ctx context.Context, bot *config.BotConfig, m *fei
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("**运行时间**: %s\n\n", time.Since(b.startedAt).Round(time.Second)))
-
 	dir := bot.Workspace
 	if d, ok := b.cwds[cwdKey(bot.ID, m.ChatID)]; ok && d != "" {
 		dir = d
 	}
-	sb.WriteString(fmt.Sprintf("**工作目录**: `%s`\n\n", dir))
+
+	var sb strings.Builder
+	// Inside a topic the scope lines are redundant with the topic card's
+	// own context block, so only a chat-wide reply repeats them.
+	if m.ThreadID == "" {
+		sb.WriteString(fmt.Sprintf("**运行时间**: %s\n\n", time.Since(b.startedAt).Round(time.Second)))
+		sb.WriteString(fmt.Sprintf("**工作目录**: `%s`\n\n", dir))
+	}
 
 	if s := b.store.Get(bot.ID, m.ChatID, m.ThreadID); s != nil {
-		sb.WriteString(fmt.Sprintf("**Claude 会话**: %s\n", shortID(string(s.ID))))
-		sb.WriteString(fmt.Sprintf("**已处理轮次**: %d\n", s.Turns))
-		sb.WriteString(fmt.Sprintf("**最后活动**: %s 前\n", time.Since(s.LastSeen).Round(time.Second)))
+		if m.ThreadID != "" {
+			sb.WriteString(fmt.Sprintf("**Claude 会话**: `%s`\n\n", shortID(string(s.ID))))
+			sb.WriteString(fmt.Sprintf("已处理 %d 轮 · 最后活动 %s 前\n",
+				s.Turns, time.Since(s.LastSeen).Round(time.Second)))
+		} else {
+			sb.WriteString(fmt.Sprintf("**Claude 会话**: %s\n", shortID(string(s.ID))))
+			sb.WriteString(fmt.Sprintf("**已处理轮次**: %d\n", s.Turns))
+			sb.WriteString(fmt.Sprintf("**最后活动**: %s 前\n", time.Since(s.LastSeen).Round(time.Second)))
+		}
 		if b.sessReaper.cutoff() > 0 {
 			sb.WriteString(fmt.Sprintf("（闲置 %s 后丢弃，不影响 Claude 本地记录）\n", b.sessReaper.cutoff()))
 		}
 	} else {
-		sb.WriteString("\n**Claude 会话**: 尚无会话\n")
+		sb.WriteString("**Claude 会话**: 尚无会话\n")
 	}
 	sb.WriteString(fmt.Sprintf("**总会话数**: %d\n", b.store.Count()))
 	return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "状态", sb.String(), standardButtons(bot, m)...))
@@ -440,8 +450,17 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 	if res.Text == "" {
 		res.Text = "_（本次无输出）_"
 	}
+
+	// Inside a topic the reply names the session it is bound to, so the user
+	// can reconcile the conversation with a local `claude --resume` session.
+	body := card.Sanitize(res.Text)
+	if m.ThreadID != "" {
+		body += fmt.Sprintf("\n\n_本话题 Claude 会话 `%s` · 工作目录 `%s`_",
+			shortID(string(res.SessionID)), workspace)
+	}
+
 	footer := card.FormatUsage(res.Usage, res.ModelUsage, res.CostUSD, elapsed)
-	final := card.Done(bot.DisplayName, card.Sanitize(res.Text), footer, standardButtons(bot, m)...)
+	final := card.Done(bot.DisplayName, body, footer, standardButtons(bot, m)...)
 	b.patchOrSend(ctx, m, msgID, final)
 	return nil
 }
@@ -479,36 +498,43 @@ func (b *Bridge) sendReject(ctx context.Context, chatID, messageID string) {
 // newTopic starts a fresh Claude session by starting a fresh Feishu topic.
 //
 // The user-visible object is the topic, not the session id: a "new session"
-// that keeps the old topic would be invisible, since every card in it still
+// that kept the old topic would be invisible, since every card in it still
 // shows the old thread. Posting a message with reply_in_thread=true creates a
 // topic whose root is that message, so replies afterwards land there.
 func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
 	if m.MessageID == "" {
-		// Without a message to reply to we cannot post into the chat at all.
 		b.log.Printf("new topic: no source message_id (chat=%s)", shortKey(m.ChatID))
 		return nil
 	}
 
 	had := b.resetSession(bot.ID, m.ChatID, m.ThreadID)
 
-	// A threaded reply must target a root message. m.ThreadID is the thread's
-	// own id, not a message, so the clicked message is the right anchor.
-	root := m.MessageID
-
-	notice := "🆕 新会话已开启。在这个话题里继续，就是一条全新的 Claude 会话；工作目录保持不变。"
+	// The notice carries the new topic's identity, but the topic has not been
+	// created yet, so it is built with no buttons and updated once Feishu
+	// returns a thread_id.
+	body := "🆕 新会话已开启。在这个话题里继续，就是一条全新的 Claude 会话。"
 	if !had {
-		notice = "本话题已开启新会话，下一条消息从头开始。工作目录保持不变。"
+		body = "本话题已开启新会话，下一条消息从头开始。"
 	}
-	c := card.CommandCard(bot.DisplayName, "新会话", notice, standardButtons(bot, m)...)
+	c := card.CommandCard(bot.DisplayName, "新会话", body)
 
-	_, threadID, err := b.cli.ReplyCardThreaded(ctx, root, c, true)
-	if err != nil || threadID == "" {
-		// Not every chat supports topics; a plain reply is correct there.
-		if err != nil {
-			b.log.Printf("new topic: threaded reply failed, replying inline: %v", err)
+	msgID, threadID, err := b.cli.ReplyCardThreaded(ctx, m.MessageID, c, true)
+	if err != nil {
+		b.log.Printf("new topic: threaded reply failed, replying inline: %v", err)
+		if m.ThreadID == "" {
+			// No topic to fork: a plain reply is correct here.
+			return b.replyCard(ctx, m,
+				card.CommandCard(bot.DisplayName, "新会话", body, chatButtons()...))
 		}
-		fallback := card.CommandCard(bot.DisplayName, "新会话", "当前没有旧会话，下一条消息会开启新会话。")
-		return b.replyCard(ctx, m, fallback)
+		return nil
+	}
+
+	// Now that the topic exists, show what it is bound to. The notice card
+	// is the topic's root, so it gets the topic-scoped button set.
+	notice := card.CommandCard(bot.DisplayName, "新会话",
+		body+"\n\n"+threadContext(nil, b.currentCwd(bot, m)), threadButtons(threadID)...)
+	if perr := b.cli.PatchCard(ctx, msgID, notice); perr != nil {
+		b.log.Printf("new topic: patch notice: %v", perr)
 	}
 
 	b.log.Printf("new topic: %s in chat %s (cleared=%v)", shortID(threadID), shortKey(m.ChatID), had)
@@ -618,11 +644,21 @@ func (b *Bridge) onCardAction(ctx context.Context, req *feishu.CardAction) (*fei
 		return nil, nil
 	}
 
-	thread := val(req.Action, "thread")
 	action := strings.ToLower(val(req.Action, "action"))
 
+	// The card callback context carries only a message id and a chat id — no
+	// thread and no parent. The card builder therefore stamps the thread into
+	// the button value, and that value is the only way to learn which topic
+	// the clicked card lives in.
+	thread := val(req.Action, "thread")
+
 	// A synthetic Message carries just enough for the shared command path to
-	// reply into the right thread.
+	// reply into the right place.
+	//
+	// Anchor on MessageID, not ThreadID. Feishu forks a topic with
+	// reply_in_thread=true only when the anchor is not itself already in a
+	// topic, so a card sitting in a topic must anchor on its own message id
+	// or the request is silently dropped.
 	msg := &feishu.Message{
 		ChatID:   req.ChatID,
 		ThreadID: thread,
@@ -630,11 +666,12 @@ func (b *Bridge) onCardAction(ctx context.Context, req *feishu.CardAction) (*fei
 	}
 	if req.MessageID == "" {
 		// Card actions always arrive with a message_id in context; without it
-		// replyCard cannot thread, so fall back to a plain send.
+		// there is nothing to reply to.
 		b.log.Printf("card action without message_id action=%s", action)
 		return nil, nil
 	}
 	msg.MessageID = req.MessageID
+	msg.ParentID = req.MessageID
 
 	// No Toast here: handleCommand already replies with a card, so a second
 	// piece of feedback for the same click would be noise.

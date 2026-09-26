@@ -24,6 +24,7 @@ func (c *Client) parseMessage(evt *larkim.P2MessageReceiveV1) (*Message, error) 
 		MessageID:    strval(msg.MessageId),
 		ChatID:       strval(msg.ChatId),
 		ThreadID:     strval(msg.ThreadId),
+		ParentID:     strval(msg.ParentId),
 		RootID:       strval(msg.RootId),
 		ChatType:     strval(msg.ChatType),
 		MessageType:  strval(msg.MessageType),

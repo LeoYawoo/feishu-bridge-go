@@ -27,9 +27,13 @@ const (
 
 // Message is the normalised form of an inbound IM message.
 type Message struct {
-	MessageID    string
-	ChatID       string
-	ThreadID     string // empty for non-topic messages
+	MessageID string
+	ChatID    string
+	ThreadID  string // empty for non-topic messages
+	// ParentID is the message being replied to. Inside a topic the bridge
+	// must reply to this id, not ThreadID: ThreadID only identifies which
+	// topic, ParentID identifies where inside it.
+	ParentID     string
 	RootID       string
 	ChatType     string // p2p | group | topic_group
 	CreateTimeMS int64
@@ -235,13 +239,19 @@ func (c *Client) replyCard(ctx context.Context, sourceMessageID string, card map
 	if err != nil {
 		return "", "", fmt.Errorf("marshal card: %w", err)
 	}
+	// reply_in_thread is deliberately omitted rather than passed as false:
+	// with a message id as the anchor the request already targets an exact
+	// message, and sending an explicit false makes Feishu re-evaluate
+	// threading instead of honouring the anchor.
+	bodyBuilder := larkim.NewReplyMessageReqBodyBuilder().
+		MsgType("interactive").
+		Content(string(body))
+	if thread {
+		bodyBuilder.ReplyInThread(true)
+	}
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(sourceMessageID).
-		Body(larkim.NewReplyMessageReqBodyBuilder().
-			MsgType("interactive").
-			Content(string(body)).
-			ReplyInThread(thread).
-			Build()).
+		Body(bodyBuilder.Build()).
 		Build()
 	resp, err := c.lark.Im.V1.Message.Reply(ctx, req)
 	if err != nil {

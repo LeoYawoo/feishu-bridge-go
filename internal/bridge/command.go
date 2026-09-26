@@ -1,7 +1,9 @@
 package bridge
 
 import (
+	"fmt"
 	"strings"
+	"time"
 
 	"feishubridge/internal/card"
 	"feishubridge/internal/config"
@@ -44,15 +46,55 @@ const helpText = `**会话控制**
 /cd 切换的目录对后续命令和 Claude 会话都生效；它只记录在本进程内存里，重启后回到默认工作目录。`
 
 // standardButtons returns the action buttons appended to most cards.
+//
+// A card already sitting inside a topic must not offer "new session": a new
+// session is materialised as a new topic, so offering it again would fork the
+// conversation. The topic-scoped set keeps only actions that make sense in
+// place.
 func standardButtons(bot *config.BotConfig, m *feishu.Message) []card.Button {
-	thread := ""
-	if m != nil {
-		thread = m.ThreadID
+	if m != nil && m.ThreadID != "" {
+		return threadButtons(m.ThreadID)
 	}
+	return chatButtons()
+}
+
+// chatButtons is the set offered outside a topic, where forking a topic is
+// the point.
+func chatButtons() []card.Button {
 	return []card.Button{
-		{Text: "🆕 新会话", Value: map[string]string{"action": "new", "thread": thread}},
+		{Text: "🆕 新会话", Value: map[string]string{"action": "new"}},
+		{Text: "⏹ 停止", Value: map[string]string{"action": "stop"}},
+		{Text: "📊 状态", Value: map[string]string{"action": "status"}},
+		{Text: "❓ 帮助", Value: map[string]string{"action": "help"}},
+	}
+}
+
+// threadButtons is the set offered inside an existing topic. thread must be
+// carried in the value: the card callback context carries only a message id,
+// never a thread id, so without it the reply would leave the topic.
+func threadButtons(thread string) []card.Button {
+	return []card.Button{
 		{Text: "⏹ 停止", Value: map[string]string{"action": "stop", "thread": thread}},
 		{Text: "📊 状态", Value: map[string]string{"action": "status", "thread": thread}},
 		{Text: "❓ 帮助", Value: map[string]string{"action": "help", "thread": thread}},
 	}
+}
+
+// threadContext renders the per-topic scope: which directory the agent runs
+// in, and which Claude session this topic is bound to.
+//
+// The session id is the only durable handle on a conversation. Showing it
+// lets the user cross-check this topic against a local `claude --resume`
+// session, so a mismatch is diagnosable instead of mysterious.
+func threadContext(s *session, workspace string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("**工作目录**: `%s`\n\n", workspace))
+	if s != nil {
+		sb.WriteString(fmt.Sprintf("**Claude 会话**: `%s`\n\n", shortID(string(s.ID))))
+		sb.WriteString(fmt.Sprintf("已处理 %d 轮 · 最后活动 %s 前\n",
+			s.Turns, time.Since(s.LastSeen).Round(time.Second)))
+	} else {
+		sb.WriteString("尚未运行会话 — 本话题下一条消息会创建 Claude 会话。\n")
+	}
+	return sb.String()
 }

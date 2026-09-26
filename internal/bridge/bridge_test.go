@@ -143,6 +143,7 @@ func newTestBridge(t *testing.T) (*Bridge, *fakeSender, *agentStub) {
 		recentDirs:      newRecentDirsStore(dir, logger.Printf),
 		inflight:        make(map[string]*turn),
 		pendingSessions: make(map[string]string),
+		topicCwd:        make(map[string]string),
 		runAgent:        as,
 	}
 	return b, fs, as
@@ -415,6 +416,53 @@ func TestNew_PromotesCwdOrder(t *testing.T) {
 	got := b.recentDirs.List("main")
 	if len(got) != 2 {
 		t.Fatalf("recentDirs len = %d, want 2; got %v", len(got), got)
+	}
+}
+
+// TestFirstTurnUsesTopicCwd verifies that when /new creates a topic with
+// an explicit cwd, the very first turn in that topic runs the agent in
+// that cwd — not bot.Workspace. Regression test for the bug where the
+// session record wasn't created until after the first turn's agent.Run,
+// so the agent would inherit bot.Workspace even though the topic's root
+// card correctly advertised the target cwd.
+func TestFirstTurnUsesTopicCwd(t *testing.T) {
+	b, _, as := newTestBridge(t)
+	ctx := context.Background()
+
+	work := filepath.Join(t.TempDir(), "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// /new <cwd> in the main chat creates the topic; the bridge records
+	// the cwd under the topic's thread id so currentCwd can resolve it
+	// on the first turn, before any session record exists.
+	if err := b.onMessage(ctx, &feishu.Message{
+		ChatID:    "oc_1",
+		ThreadID:  "",
+		MessageID: "om_root",
+		RawText:   "/new " + work,
+	}); err != nil {
+		t.Fatalf("onMessage(/new): %v", err)
+	}
+
+	// First turn inside the new topic. The fake sender assigned the
+	// topic root the message id "msg_1" and the topic a thread id
+	// derived from it.
+	threadID := "omt_msg_1"
+	_ = b.onMessage(ctx, &feishu.Message{
+		ChatID:    "oc_1",
+		ThreadID:  threadID,
+		MessageID: "om_msg",
+		RawText:   "hello",
+	})
+
+	if len(as.cfgs) != 1 {
+		t.Fatalf("agent invoked %d times; want 1", len(as.cfgs))
+	}
+	if as.cfgs[0].Workspace != work {
+		t.Errorf("agent workspace = %q, want %q (topic cwd, not bot workspace)",
+			as.cfgs[0].Workspace, work)
 	}
 }
 

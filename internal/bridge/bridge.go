@@ -93,6 +93,23 @@ type Bridge struct {
 	pendingMu       sync.Mutex
 	pendingSessions map[string]string
 
+	// topicCwd maps threadID -> cwd for topics that exist but have no
+	// session record yet. The very first message in a new topic is the
+	// trigger that creates the session record (runTurn sets session.Cwd),
+	// so before that fires, currentCwd would otherwise fall through to
+	// bot.Workspace and the agent would run in the wrong directory even
+	// though the topic's root card correctly advertises the intended cwd.
+	// newTopic writes here; the session record takes over on the first turn.
+	//
+	// Deliberately in-memory only: on a restart the topic either has a
+	// session record (and cwd lives in session.Cwd) or it doesn't (and
+	// the topic is stale — nothing to remember).
+	//
+	// Guarded by topicCwdMu. Separate lock so runTurn can hold store's
+	// lock while reading currentCwd without risking re-entrancy.
+	topicCwdMu sync.Mutex
+	topicCwd   map[string]string
+
 	startedAt time.Time
 }
 
@@ -134,6 +151,7 @@ func New(cfg *config.Config, cli *feishu.Client, logger *log.Logger) *Bridge {
 		log:             logger,
 		inflight:        make(map[string]*turn),
 		pendingSessions: make(map[string]string),
+		topicCwd:        make(map[string]string),
 		runAgent:        realAgentRunner{},
 	}
 	b.store = newSessionStore(cfg.Bots[0].Workspace, logger.Printf)
@@ -256,19 +274,42 @@ func (b *Bridge) replyConsoleCard(ctx context.Context, bot *config.BotConfig, m 
 
 // currentCwd returns the cwd the agent should run in for this message's
 // topic. Precedence:
-//  1. pendingSessions[thread] is not consulted here — that's a session id,
-//     not a cwd.
-//  2. The topic's session record, if any. session.Cwd is written by
+//  1. The topic's session record, if any. session.Cwd is written by
 //     runTurn on the first turn and is authoritative thereafter.
-//  3. Fall back to the bot's configured workspace. This is only reached for
-//     brand-new topics with no session yet (immediately after /new).
+//  2. topicCwd[threadID] — set by newTopic when the topic is created.
+//     Covers the window between "topic exists, no session yet" and
+//     "first turn creates the session record". Without this slot the
+//     first turn would fall back to bot.Workspace and land in the wrong
+//     directory even though the topic's root card advertised the target.
+//  3. bot.Workspace — reached only for main-chat messages with no topic.
 func (b *Bridge) currentCwd(bot *config.BotConfig, m *feishu.Message) string {
 	if m.ThreadID != "" {
 		if s := b.store.Get(bot.ID, m.ChatID, m.ThreadID); s != nil && s.Cwd != "" {
 			return s.Cwd
 		}
+		if cwd := b.lookupTopicCwd(m.ThreadID); cwd != "" {
+			return cwd
+		}
 	}
 	return bot.Workspace
+}
+
+// setTopicCwd records the cwd a freshly created topic should run in
+// until its first turn promotes it into a session record. Called from
+// newTopic; safe to call with empty threadID or cwd as a no-op.
+func (b *Bridge) setTopicCwd(threadID, cwd string) {
+	if threadID == "" || cwd == "" {
+		return
+	}
+	b.topicCwdMu.Lock()
+	defer b.topicCwdMu.Unlock()
+	b.topicCwd[threadID] = cwd
+}
+
+func (b *Bridge) lookupTopicCwd(threadID string) string {
+	b.topicCwdMu.Lock()
+	defer b.topicCwdMu.Unlock()
+	return b.topicCwd[threadID]
 }
 
 // ---- the turn ------------------------------------------------------------
@@ -299,8 +340,12 @@ func (b *Bridge) setPendingSession(threadID, sessionID string) {
 }
 
 func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.Message, text string) error {
-	// Show the thinking card immediately.
-	msgID, err := b.cli.SendCardInThread(ctx, m.ChatID, m.ThreadID, card.Processing(bot.DisplayName))
+	// Show the thinking card immediately. Reply-anchored because Feishu
+	// only routes a message into a topic through the Reply API — creating
+	// a fresh message with chat_id alone lands it in the main conversation
+	// regardless of the target thread. Use ParentID inside a topic so
+	// the anchor sits inside it; MessageID when we're in the main chat.
+	msgID, err := b.cli.ReplyCard(ctx, b.replyAnchor(m), card.Processing(bot.DisplayName), m.ThreadID != "")
 	if err != nil {
 		b.log.Printf("send processing card: %v", err)
 	}
@@ -458,11 +503,24 @@ func (b *Bridge) patchOrSend(ctx context.Context, m *feishu.Message, msgID strin
 	if msgID != "" {
 		if err := b.cli.PatchCard(ctx, msgID, c); err != nil {
 			b.log.Printf("patch card failed, sending new: %v", err)
-			b.cli.SendCardInThread(ctx, m.ChatID, m.ThreadID, c)
+			_, _ = b.cli.ReplyCard(ctx, b.replyAnchor(m), c, m.ThreadID != "")
 		}
 		return
 	}
-	b.cli.SendCardInThread(ctx, m.ChatID, m.ThreadID, c)
+	_, _ = b.cli.ReplyCard(ctx, b.replyAnchor(m), c, m.ThreadID != "")
+}
+
+// replyAnchor picks the message id to anchor a reply on. Inside a topic
+// the anchor must sit inside the topic so the reply inherits the thread;
+// ParentID is the reply target for topic messages (RootID would work too
+// but ParentID is what the SDK returns as "the message this one replies
+// to", and it is stable for the lifetime of the topic). Outside a topic
+// the user's own MessageID is the only sensible anchor.
+func (b *Bridge) replyAnchor(m *feishu.Message) string {
+	if m.ThreadID != "" && m.ParentID != "" {
+		return m.ParentID
+	}
+	return m.MessageID
 }
 
 func (b *Bridge) replyCard(ctx context.Context, m *feishu.Message, c map[string]any) error {
@@ -535,6 +593,13 @@ func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.
 	// is real: an inherited cwd that never materialises into a topic is
 	// not "recently used".
 	b.recentDirs.Add(bot.ID, target)
+
+	// Record the topic's cwd so currentCwd can resolve it before the
+	// first turn creates a session record. Without this the first
+	// message in a new topic would fall back to bot.Workspace and land
+	// in the wrong directory, despite the topic's root card showing
+	// the correct target.
+	b.setTopicCwd(threadID, target)
 
 	// The notice is now the topic's root card. Attach session-picker buttons:
 	// up to 5 history sessions (from the byCwd index) plus [🆕 新]. Both

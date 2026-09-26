@@ -51,6 +51,32 @@ go mod tidy
 go build -o feishubridge ./cmd/feishubridge
 ```
 
+### 交叉编译（多平台）
+
+```bash
+make release          # 全矩阵：windows/linux/darwin × amd64/arm64 -> dist/
+make release-windows  # 仅 windows
+make release-linux    # 仅 linux
+make test             # go test ./...
+make vet              # go vet ./...
+make clean            # 清理 dist/ 和本地二进制
+```
+
+版本号通过 `-ldflags` 注入，默认取 `git describe`，可用 `VERSION=v1.2.3 make release` 覆盖。
+
+`build.bat` 是本地一键构建脚本（`vet` + `test` + `build`），里面写死了你机器上的
+Go 工具链路径，所以已加入 `.gitignore`——不提交。跨平台构建用 Makefile。
+
+> 如果你的机器上没有 `make`，可以直接跑等价的 go 命令：
+>
+> ```bash
+> for p in windows/amd64 linux/amd64 linux/arm64; do
+>   os=${p%%/*}; arch=${p##*/}
+>   GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" \
+>     -o dist/feishubridge-$os-$arch ./cmd/feishubridge
+> done
+> ```
+
 ## 配置
 
 复制示例配置并按注释填写：

@@ -4,12 +4,20 @@
 *.exe
 *.test
 *.out
+/dist/
+
+# local-only build scripts (paths are machine-specific)
+build.bat
 
 # editor / os
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# runtime state written into the workspace
+.feishu-bridge-shell.json
+.feishu-bridge-sessions.json
 
 # secrets
 .env

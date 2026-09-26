@@ -31,7 +31,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.22.x', '1.26.x']
+        # Single version: the code targets go 1.22+ per go.mod but is written
+        # against 1.26, and keeping an older leg only risks false failures.
+        go: ['1.26.x']
+        # Both OSes stay: cross-platform coverage is the point of this job.
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
@@ -69,15 +72,23 @@ jobs:
         shell: bash
         run: go test ./...
 
+      # Invoke go build directly: windows-latest does not ship GNU make, so
+      # "make build" fails there with "make: command not found". The Makefile
+      # stays the source of truth for releases (run on ubuntu), but the test
+      # job needs no dependency beyond the Go toolchain itself.
       - name: Build (host)
         shell: bash
-        run: make build
+        run: go build -trimpath -o feishubridge ./cmd/feishubridge
 
   # ---- 2. release: full matrix + GitHub Release -------------------------
   # Only runs on workflow_dispatch. Kept separate so an ordinary push does not
   # spend 6 cross-compiles just to produce artifacts nobody asked for.
   release:
     name: release
+    # Gate on the test job so a bad tree can never reach the artifact step.
+    # needs runs against every leg of the matrix, so both ubuntu- and
+    # windows- test runs must pass before any binary is built or published.
+    needs: test
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:

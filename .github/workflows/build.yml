@@ -97,7 +97,9 @@ jobs:
 
       - name: Create GitHub Release
         env:
-          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+          # Quoted: GitHub's YAML parser rejects an unquoted expression value
+          # here (it is the only one in this file containing a # character).
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
           # TAG was written to $GITHUB_ENV by the Build matrix step.
           # Drop a prior release of the same tag so a re-run is idempotent.

@@ -8,7 +8,10 @@ PKG     := feishubridge
 CMD     := ./cmd/feishubridge
 DIST    := dist
 
-# Module cache for an offline build. Empty string is the platform default.
+# GOMODCACHE for a build against a specific module cache. Empty is the
+# platform default (~/.cache/go-build / ~/go/pkg/mod), which is what you want
+# in normal use. Set it only for reproducible CI builds:
+#   make release GOMODCACHE=/home/ci/gomod
 GOMODCACHE ?=
 ifdef GOMODCACHE
 	GOMODCACHE_ENV := GOMODCACHE=$(GOMODCACHE)
@@ -80,6 +83,8 @@ vet:
 
 fmt:
 	$(GO) fmt ./cmd/... ./internal/...
+	$(GO) run golang.org/x/tools/cmd/goimports@latest -w ./cmd ./internal
+	@echo "fmt done"
 
 tidy:
 	$(GO) mod tidy

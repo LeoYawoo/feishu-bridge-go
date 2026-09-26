@@ -84,6 +84,12 @@ type session struct {
 	BotID     string
 	ChatID    string
 	ThreadID  string
+	// Cwd is the working directory the session was created in. It is written
+	// once when the session is first materialised and never mutated; /cd is
+	// gone, so a topic's cwd is fixed for its lifetime. Persisted so a
+	// restarted bridge can still resolve the topic's cwd from the session
+	// record alone.
+	Cwd       string
 	CreatedAt time.Time
 	LastSeen  time.Time
 	Turns     int
@@ -466,8 +472,13 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 		if existing != nil {
 			se.CreatedAt = existing.CreatedAt
 			se.Turns = existing.Turns + 1
+			// Cwd is sticky: once written on the first turn it never moves.
+			se.Cwd = existing.Cwd
 		} else {
 			se.CreatedAt = time.Now()
+			// The workspace passed to the agent is authoritative: that's the
+			// cwd the session actually ran in.
+			se.Cwd = workspace
 		}
 		b.store.Set(se)
 		b.store.Save()

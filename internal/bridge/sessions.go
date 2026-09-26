@@ -78,6 +78,7 @@ type sessionStore struct {
 	mu    sync.Mutex
 	byKey map[string]*session        // key = sessionKey(bot, chat, thread)
 	byID  map[agent.SessionID]string // session_id -> key
+	byCwd map[string][]string        // cwd -> []key, most-recent-first
 	path  string
 	logf  func(format string, args ...any)
 }
@@ -89,6 +90,7 @@ func newSessionStore(dir string, logf func(string, ...any)) *sessionStore {
 	s := &sessionStore{
 		byKey: make(map[string]*session),
 		byID:  make(map[agent.SessionID]string),
+		byCwd: make(map[string][]string),
 		path:  filepath.Join(dir, sessionsFile),
 		logf:  logf,
 	}
@@ -120,6 +122,7 @@ func (s *sessionStore) load() error {
 		key := sessionKey(se.BotID, se.ChatID, se.ThreadID)
 		s.byKey[key] = se
 		s.byID[se.ID] = key
+		s.indexByCwd(key, se)
 	}
 	return nil
 }
@@ -150,7 +153,9 @@ func (s *sessionStore) Get(botID, chatID, threadID string) *session {
 	return s.byKey[sessionKey(botID, chatID, threadID)]
 }
 
-// Set upserts and maintains the reverse index.
+// Set upserts and maintains the reverse indices. The byCwd bucket is
+// re-keyed off the incoming record's Cwd so a session whose cwd changes
+// during an upsert lands in the right bucket.
 func (s *sessionStore) Set(se *session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,8 +166,11 @@ func (s *sessionStore) Set(se *session) {
 	if se.LastSeen.IsZero() {
 		se.LastSeen = time.Now()
 	}
+	// Remove this key from any cwd bucket before re-adding under the new cwd.
+	s.unindexByCwd(key)
 	s.byKey[key] = se
 	s.byID[se.ID] = key
+	s.indexByCwd(key, se)
 }
 
 // Delete removes by chat coordinates.
@@ -173,6 +181,7 @@ func (s *sessionStore) Delete(botID, chatID, threadID string) {
 	if se := s.byKey[key]; se != nil && se.ID != "" {
 		delete(s.byID, se.ID)
 	}
+	s.unindexByCwd(key)
 	delete(s.byKey, key)
 }
 
@@ -210,7 +219,80 @@ func (s *sessionStore) ClearIdle(cutoff time.Duration) int {
 		if s.byKey[key] == se {
 			delete(s.byID, se.ID)
 			delete(s.byKey, key)
+			s.unindexByCwd(key)
 		}
 	}
 	return len(idle)
+}
+
+// SessionsForCwd returns the sessions whose Cwd matches, most-recent-first,
+// capped at limit. Empty/nil is returned for unknown cwds or when there is
+// nothing to list. The topic-root card uses this for its history-session
+// buttons.
+//
+// Cwd is compared exactly as stored; the caller is responsible for
+// normalising (filepath.Abs/Join) before and after writing. Sessions with an
+// empty Cwd (legacy records from before the field was added) are never
+// returned here — the caller's fallback is the bot's configured workspace.
+func (s *sessionStore) SessionsForCwd(cwd string, limit int) []*session {
+	if cwd == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := s.byCwd[cwd]
+	if len(keys) == 0 {
+		return nil
+	}
+	if limit > 0 && limit < len(keys) {
+		keys = keys[:limit]
+	}
+	out := make([]*session, 0, len(keys))
+	for _, k := range keys {
+		if se := s.byKey[k]; se != nil {
+			out = append(out, se)
+		}
+	}
+	return out
+}
+
+// indexByCwd adds key to the head of the cwd bucket when se.Cwd is set.
+// The caller must hold s.mu.
+func (s *sessionStore) indexByCwd(key string, se *session) {
+	if se == nil || se.Cwd == "" {
+		return
+	}
+	bucket := s.byCwd[se.Cwd]
+	// Promote to front, deduping (shouldn't happen post-unindex, but cheap).
+	out := make([]string, 0, len(bucket)+1)
+	out = append(out, key)
+	for _, k := range bucket {
+		if k != key {
+			out = append(out, k)
+		}
+	}
+	s.byCwd[se.Cwd] = out
+}
+
+// unindexByCwd removes key from whatever cwd bucket it currently lives in.
+// The caller must hold s.mu.
+func (s *sessionStore) unindexByCwd(key string) {
+	for cwd, bucket := range s.byCwd {
+		found := false
+		for i, k := range bucket {
+			if k == key {
+				found = true
+				out := make([]string, 0, len(bucket)-1)
+				out = append(out, bucket[:i]...)
+				out = append(out, bucket[i+1:]...)
+				if len(out) == 0 {
+					delete(s.byCwd, cwd)
+				} else {
+					s.byCwd[cwd] = out
+				}
+				return
+			}
+		}
+		_ = found
+	}
 }

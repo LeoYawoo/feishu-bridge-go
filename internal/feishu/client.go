@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -61,6 +63,10 @@ type EventHandlers struct {
 }
 
 // CardAction is a card interaction callback.
+//
+// Feishu's callback context carries only the clicked card's open_message_id
+// and the chat id - no thread id and no parent id. Anything else must be
+// stamped into the button value at build time.
 type CardAction struct {
 	Action    map[string]any // the clicked button's value map
 	Operator  string         // open_id of who clicked
@@ -83,6 +89,7 @@ type Client struct {
 	appSecret string
 	domain    Domain
 	log       *log.Logger
+	debugCard bool
 
 	handler *EventHandlers
 
@@ -93,6 +100,11 @@ type Client struct {
 type Options struct {
 	// LogLevel maps to larkcore.LogLevel; 0 leaves the SDK default.
 	LogLevel larkcore.LogLevel
+	// DebugCard logs the full card JSON of every outbound message. Off by
+	// default: a card is a large nested blob and the log is meant to stay
+	// scannable. Turn it on with -loglevel debug to diff what was actually
+	// sent against what the Feishu webview is showing.
+	DebugCard bool
 }
 
 // New builds a client for the given app credentials.
@@ -115,6 +127,7 @@ func New(appID, appSecret string, domain Domain, opts Options) *Client {
 		domain:    domain,
 		log:       log.Default(),
 		startupMS: time.Now().UnixMilli(),
+		debugCard: opts.DebugCard,
 	}
 }
 
@@ -156,6 +169,9 @@ func (c *Client) SendCardInThread(ctx context.Context, chatID, threadID string, 
 	if err != nil {
 		return "", fmt.Errorf("marshal card: %w", err)
 	}
+	if c.debugCard {
+		c.logCard("chat="+short(chatID)+" thread="+short(threadID), string(body))
+	}
 
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType("chat_id").
@@ -181,6 +197,9 @@ func (c *Client) PatchCard(ctx context.Context, messageID string, card map[strin
 	body, err := json.Marshal(card)
 	if err != nil {
 		return fmt.Errorf("marshal card: %w", err)
+	}
+	if c.debugCard {
+		c.logCard("patch "+short(messageID), string(body))
 	}
 	req := larkim.NewPatchMessageReqBuilder().
 		MessageId(messageID).
@@ -239,6 +258,9 @@ func (c *Client) replyCard(ctx context.Context, sourceMessageID string, card map
 	if err != nil {
 		return "", "", fmt.Errorf("marshal card: %w", err)
 	}
+	if c.debugCard {
+		c.logCard(short(sourceMessageID), string(body))
+	}
 	// reply_in_thread is deliberately omitted rather than passed as false:
 	// with a message id as the anchor the request already targets an exact
 	// message, and sending an explicit false makes Feishu re-evaluate
@@ -263,7 +285,12 @@ func (c *Client) replyCard(ctx context.Context, sourceMessageID string, card map
 	if resp.Data == nil {
 		return "", "", nil
 	}
-	return strval(resp.Data.MessageId), strval(resp.Data.ThreadId), nil
+	id := strval(resp.Data.MessageId)
+	thr := strval(resp.Data.ThreadId)
+	c.L().Printf("send reply anchor=%s thread=%v -> msg=%s thread_id=%q root=%q parent=%q",
+		short(sourceMessageID), thread, short(id), thr,
+		strval(resp.Data.RootId), strval(resp.Data.ParentId))
+	return id, thr, nil
 }
 
 // ReplyText replies to a message with plain text.
@@ -292,4 +319,82 @@ func strval(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// short keeps an id readable on one log line without losing which one it is.
+func short(id string) string {
+	if len(id) <= 14 {
+		return id
+	}
+	return id[:14]
+}
+
+// logCard writes one line for an outbound card. The full JSON is logged because
+// the bridge's whole theory of topic routing lives inside the button value
+// maps - a card that renders right can still carry the wrong anchor.
+func (c *Client) logCard(where, body string) {
+	c.L().Printf("send card %s buttons=%s", where, cardButtons(body))
+	c.L().Printf("send card %s json=%s", where, strings.ReplaceAll(body, "\n", " "))
+}
+
+// cardButtons pulls every button's text+value out of a card JSON blob so the
+// line is readable without a JSON viewer.
+func cardButtons(body string) string {
+	var card map[string]any
+	if err := json.Unmarshal([]byte(body), &card); err != nil {
+		return "<unmarshal>"
+	}
+	b, _ := card["body"].(map[string]any)
+	elems, _ := b["elements"].([]any)
+	out := make([]string, 0, len(elems))
+	for _, e := range elems {
+		el, _ := e.(map[string]any)
+		if el == nil || el["tag"] != "button" {
+			continue
+		}
+		t := el["text"]
+		if s, ok := t.(map[string]any); ok {
+			if c, ok := s["content"].(string); ok {
+				t = c
+			}
+		}
+		v, _ := json.Marshal(el["value"])
+		out = append(out, fmt.Sprintf("%s=%s", t, string(v)))
+	}
+	if len(out) == 0 {
+		return "[]"
+	}
+	return "{" + strings.Join(out, " ") + "}"
+}
+
+// clip bounds a logged text payload so one message cannot flood the log.
+func clip(s string) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", "\\n"), "\r", "")
+	if len(s) <= 120 {
+		return s
+	}
+	return s[:120] + "…"
+}
+
+// actionName pulls the "action" key out of a card callback's value map.
+func actionName(a *callback.CallBackAction) string {
+	if a == nil {
+		return "nil"
+	}
+	if v, ok := a.Value["action"].(string); ok {
+		return v
+	}
+	return a.Tag
+}
+
+// actionValues renders a callback's value map for the log line.
+func actionValues(a *callback.CallBackAction) string {
+	if a == nil || a.Value == nil {
+		return "nil"
+	}
+	b, err := json.Marshal(a.Value)
+	if err != nil {
+		return fmt.Sprintf("<%v>", err)
+	}
+	return clip(string(b))
 }

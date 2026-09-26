@@ -22,6 +22,10 @@ Thumbs.db
 .feishu-bridge-shell.json
 .feishu-bridge-sessions.json
 
+# local debugging scratch (browser snapshots, editor swap files)
+snap*.txt
+*.exe~
+
 # secrets
 .env
 config.json

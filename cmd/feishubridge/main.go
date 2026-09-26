@@ -40,7 +40,8 @@ func main() {
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmsgprefix)
-	if *logLevel == "debug" {
+	debug := *logLevel == "debug"
+	if debug {
 		log.SetFlags(log.LstdFlags | log.Lmsgprefix | log.Lshortfile)
 		logger.SetFlags(log.LstdFlags | log.Lmsgprefix | log.Lshortfile)
 	}
@@ -57,7 +58,10 @@ func main() {
 		domain = feishu.DomainLark
 	}
 
-	cli := feishu.New(cfg.AppID, cfg.AppSecr, domain, feishu.Options{})
+	// -loglevel debug also dumps full card JSON on the way out. Keep the two
+	// coupled: the log is for diagnosing exactly this, and turning one on
+	// without the other leaves half the picture.
+	cli := feishu.New(cfg.AppID, cfg.AppSecr, domain, feishu.Options{DebugCard: debug})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

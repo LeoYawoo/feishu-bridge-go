@@ -227,18 +227,29 @@ func (b *Bridge) handleCommand(ctx context.Context, bot *config.BotConfig, m *fe
 // cwdKey joins bot and chat into the key used for the cwd table.
 func cwdKey(botID, chatID string) string { return botID + "/" + chatID }
 
-// currentCwd returns the chat's working directory, falling back to the bot's
-// configured workspace when the user has not /cd'd yet.
+// topicCwdKey is cwdKey plus the topic. The working directory is per topic,
+// not per chat: a topic is the user's unit of work, and "new session" must
+// inherit the directory the user was working in rather than resetting to the
+// bot's default workspace.
+func topicCwdKey(botID, chatID, threadID string) string {
+	if threadID == "" {
+		return cwdKey(botID, chatID)
+	}
+	return botID + "/" + chatID + "/" + threadID
+}
+
+// currentCwd returns the topic's working directory, falling back to the bot's
+// configured workspace when nothing has been recorded.
 func (b *Bridge) currentCwd(bot *config.BotConfig, m *feishu.Message) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if d, ok := b.cwds[cwdKey(bot.ID, m.ChatID)]; ok && d != "" {
+	if d, ok := b.cwds[topicCwdKey(bot.ID, m.ChatID, m.ThreadID)]; ok && d != "" {
 		return d
 	}
 	return bot.Workspace
 }
 
-// chdir resolves the target and records it as the chat's working directory.
+// chdir resolves the target and records it as the topic's working directory.
 // Only existing directories are accepted, so /cd into a typo cannot silently
 // strand later /ls calls.
 func (b *Bridge) chdir(bot *config.BotConfig, m *feishu.Message, target string) (string, error) {
@@ -253,7 +264,7 @@ func (b *Bridge) chdir(bot *config.BotConfig, m *feishu.Message, target string) 
 		return "", fmt.Errorf("不是目录: %s", target)
 	}
 	b.mu.Lock()
-	b.cwds[cwdKey(bot.ID, m.ChatID)] = target
+	b.cwds[topicCwdKey(bot.ID, m.ChatID, m.ThreadID)] = target
 	b.mu.Unlock()
 	return target, nil
 }
@@ -294,13 +305,10 @@ func (b *Bridge) listDir(bot *config.BotConfig, m *feishu.Message) (string, erro
 }
 
 func (b *Bridge) handleStatus(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
+	dir := b.currentCwd(bot, m)
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	dir := bot.Workspace
-	if d, ok := b.cwds[cwdKey(bot.ID, m.ChatID)]; ok && d != "" {
-		dir = d
-	}
 
 	var sb strings.Builder
 	// Inside a topic the scope lines are redundant with the topic card's
@@ -502,12 +510,24 @@ func (b *Bridge) sendReject(ctx context.Context, chatID, messageID string) {
 // shows the old thread. Posting a message with reply_in_thread=true creates a
 // topic whose root is that message, so replies afterwards land there.
 func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
+	// m.MessageID is the topic's root when the click came from inside a topic,
+	// and the clicked card otherwise. Either is a valid anchor: reply
+	// reply_in_thread=true forks a topic only when the anchor is not already
+	// inside one.
 	if m.MessageID == "" {
-		b.log.Printf("new topic: no source message_id (chat=%s)", shortKey(m.ChatID))
+		b.log.Printf("new topic: no anchor (chat=%s)", shortKey(m.ChatID))
 		return nil
 	}
 
 	had := b.resetSession(bot.ID, m.ChatID, m.ThreadID)
+
+	// Capture the cwd before the reply: the new topic has no record yet, so
+	// this is the only chance to inherit the directory the user was working
+	// in. Otherwise a topic fork would silently drop back to the bot's
+	// default workspace.
+	inherit := b.currentCwd(bot, m)
+	b.log.Printf("new topic: anchor=%s root=%s thread=%s cwd=%s cleared=%v",
+		shortID(m.MessageID), shortID(m.RootID), shortID(m.ThreadID), inherit, had)
 
 	// The notice carries the new topic's identity, but the topic has not been
 	// created yet, so it is built with no buttons and updated once Feishu
@@ -531,14 +551,26 @@ func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.
 
 	// Now that the topic exists, show what it is bound to. The notice card
 	// is the topic's root, so it gets the topic-scoped button set.
+	b.setCwd(bot.ID, m.ChatID, threadID, inherit)
+
 	notice := card.CommandCard(bot.DisplayName, "新会话",
-		body+"\n\n"+threadContext(nil, b.currentCwd(bot, m)), threadButtons(threadID)...)
+		body+"\n\n"+threadContext(nil, inherit), threadButtons(threadID, msgID)...)
 	if perr := b.cli.PatchCard(ctx, msgID, notice); perr != nil {
 		b.log.Printf("new topic: patch notice: %v", perr)
+	} else {
+		b.log.Printf("new topic: notice patched %s with %d buttons", shortID(msgID), len(notice))
 	}
 
-	b.log.Printf("new topic: %s in chat %s (cleared=%v)", shortID(threadID), shortKey(m.ChatID), had)
+	b.log.Printf("new topic: %s in chat %s cwd=%s cleared=%v",
+		shortID(threadID), shortKey(m.ChatID), inherit, had)
 	return nil
+}
+
+// setCwd records a working directory for one topic.
+func (b *Bridge) setCwd(botID, chatID, threadID, dir string) {
+	b.mu.Lock()
+	b.cwds[topicCwdKey(botID, chatID, threadID)] = dir
+	b.mu.Unlock()
 }
 
 // resetSession drops the thread's session record and reports whether there
@@ -646,32 +678,34 @@ func (b *Bridge) onCardAction(ctx context.Context, req *feishu.CardAction) (*fei
 
 	action := strings.ToLower(val(req.Action, "action"))
 
-	// The card callback context carries only a message id and a chat id — no
-	// thread and no parent. The card builder therefore stamps the thread into
-	// the button value, and that value is the only way to learn which topic
-	// the clicked card lives in.
+	// The callback carries only the clicked card's message id. The builder
+	// stamps the topic's thread id and root message id into the button value,
+	// because neither survives the round trip.
 	thread := val(req.Action, "thread")
+	root := val(req.Action, "root")
+	if root == "" {
+		// Older cards predate the root stamp; the clicked card is the best
+		// available anchor.
+		root = req.MessageID
+	}
 
-	// A synthetic Message carries just enough for the shared command path to
-	// reply into the right place.
-	//
-	// Anchor on MessageID, not ThreadID. Feishu forks a topic with
-	// reply_in_thread=true only when the anchor is not itself already in a
-	// topic, so a card sitting in a topic must anchor on its own message id
-	// or the request is silently dropped.
 	msg := &feishu.Message{
 		ChatID:   req.ChatID,
 		ThreadID: thread,
 		SenderID: req.Operator,
 	}
-	if req.MessageID == "" {
-		// Card actions always arrive with a message_id in context; without it
-		// there is nothing to reply to.
-		b.log.Printf("card action without message_id action=%s", action)
+	if root == "" {
+		b.log.Printf("card action without anchor action=%s", action)
 		return nil, nil
 	}
-	msg.MessageID = req.MessageID
-	msg.ParentID = req.MessageID
+	// Anchor on the topic's root message, never on the clicked card's own id.
+	// reply_in_thread=true forks a new topic only when the anchor is not
+	// itself already inside one; a card that is itself a topic reply carries
+	// no thread context in the callback, so anchoring on it would post into
+	// the chat instead of the topic.
+	msg.MessageID = root
+	msg.ParentID = root
+	msg.RootID = root
 
 	// No Toast here: handleCommand already replies with a card, so a second
 	// piece of feedback for the same click would be noise.

@@ -37,10 +37,20 @@ func (c *Client) onReceiveV1(ctx context.Context, evt *larkim.P2MessageReceiveV1
 		c.L().Printf("parse message: %v", err)
 		return nil // never let a parse failure kill the connection
 	}
+	c.logInbound(m)
 	if h := c.handler; h != nil && h.OnMessage != nil {
 		return h.OnMessage(ctx, m)
 	}
 	return nil
+}
+
+// logInbound writes one line per received message with every threading field,
+// so a "reply landed in the wrong place" report is decidable from the log
+// alone. ThreadID/RootID/ParentID are the whole story for topic routing.
+func (c *Client) logInbound(m *Message) {
+	c.L().Printf("recv %s type=%s sender=%s chat=%s thread=%q root=%q parent=%q text=%q",
+		short(m.MessageID), m.MessageType, short(m.SenderID), short(m.ChatID),
+		m.ThreadID, m.RootID, m.ParentID, clip(m.RawText))
 }
 
 func (c *Client) onCardAction(ctx context.Context, evt *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
@@ -49,6 +59,18 @@ func (c *Client) onCardAction(ctx context.Context, evt *callback.CardActionTrigg
 	}
 	handler := c.handler
 	req := evt.Event
+
+	// Host/DeliveryType/Context are the only place the callback tells us which
+	// message was clicked, so they all go into the log line.
+	if req.Context != nil {
+		c.L().Printf("card action %s by %s: message=%s chat=%s host=%s value=%s",
+			actionName(req.Action), short(req.Operator.OpenID),
+			short(req.Context.OpenMessageID), short(req.Context.OpenChatID),
+			req.Host, actionValues(req.Action))
+	} else {
+		c.L().Printf("card action %s by %s: NO CONTEXT host=%s",
+			actionName(req.Action), short(req.Operator.OpenID), req.Host)
+	}
 
 	ca := &CardAction{
 		Operator:  req.Operator.OpenID,

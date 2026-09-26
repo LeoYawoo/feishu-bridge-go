@@ -51,9 +51,15 @@ const helpText = `**会话控制**
 // session is materialised as a new topic, so offering it again would fork the
 // conversation. The topic-scoped set keeps only actions that make sense in
 // place.
+//
+// The root message id is stamped into every topic button. The callback only
+// carries the clicked card's own id, and reply_in_thread=true forks a topic
+// only when the anchor is not itself inside one - so a reply to a card that
+// is already a topic reply would leave the topic entirely. Anchoring on the
+// root keeps every follow-up inside it.
 func standardButtons(bot *config.BotConfig, m *feishu.Message) []card.Button {
 	if m != nil && m.ThreadID != "" {
-		return threadButtons(m.ThreadID)
+		return threadButtons(m.ThreadID, m.RootID)
 	}
 	return chatButtons()
 }
@@ -69,14 +75,15 @@ func chatButtons() []card.Button {
 	}
 }
 
-// threadButtons is the set offered inside an existing topic. thread must be
-// carried in the value: the card callback context carries only a message id,
-// never a thread id, so without it the reply would leave the topic.
-func threadButtons(thread string) []card.Button {
+// threadButtons is the set offered inside an existing topic.
+func threadButtons(thread, root string) []card.Button {
+	v := func(a string) map[string]string {
+		return map[string]string{"action": a, "thread": thread, "root": root}
+	}
 	return []card.Button{
-		{Text: "⏹ 停止", Value: map[string]string{"action": "stop", "thread": thread}},
-		{Text: "📊 状态", Value: map[string]string{"action": "status", "thread": thread}},
-		{Text: "❓ 帮助", Value: map[string]string{"action": "help", "thread": thread}},
+		{Text: "⏹ 停止", Value: v("stop")},
+		{Text: "📊 状态", Value: v("status")},
+		{Text: "❓ 帮助", Value: v("help")},
 	}
 }
 

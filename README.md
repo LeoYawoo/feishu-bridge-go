@@ -67,7 +67,11 @@ make clean            # 清理 dist/ 和本地二进制
 `build.bat` 是本地一键构建脚本（`vet` + `test` + `build`），里面写死了你机器上的
 Go 工具链路径，所以已加入 `.gitignore`——不提交。跨平台构建用 Makefile。
 
-> 如果你的机器上没有 `make`，可以直接跑等价的 go 命令：
+> **Windows 用户**：本机 make 叫 `mingw32-make`（mingw64 自带），例如
+> `C:\soft\mingw\mingw64\bin\mingw32-make.exe`。Makefile 已针对它验证过，
+> 用法完全一样：`mingw32-make release`。`build.bat` 已把该路径加入 PATH。
+>
+> 没有 make 的话也可以直接跑等价的 go 命令：
 >
 > ```bash
 > for p in windows/amd64 linux/amd64 linux/arm64; do

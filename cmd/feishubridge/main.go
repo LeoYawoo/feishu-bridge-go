@@ -25,6 +25,16 @@ import (
 	"feishubridge/internal/feishu"
 )
 
+// Build metadata, stamped at link time via
+// -ldflags "-X main.Version=... -X main.Commit=... -X main.BuildTime=...".
+// The Makefile supplies them; a hand build leaves them empty and prints
+// "(not stamped)".
+var (
+	Version   = ""
+	Commit    = ""
+	BuildTime = ""
+)
+
 func main() {
 	configPath := flag.String("config", "", "config file path (default: $FEISHU_BRIDGE_CONFIG or ~/.config/feishu-bridge/config.json)")
 	logLevel := flag.String("loglevel", "info", "log level: debug or info")
@@ -55,6 +65,9 @@ func main() {
 
 	b := bridge.New(cfg, cli, logger)
 
+	logger.Printf("feishubridge %s (commit %s, built %s)",
+		orDev(Version), orDev(Commit), orDev(BuildTime))
+
 	logger.Printf("starting feishubridge: %d bot(s), domain=%s, agent=%s, workspace=%s",
 		len(cfg.Bots), cfg.Domain, cfg.Agent.Command, cfg.WorkDir)
 
@@ -77,4 +90,13 @@ func main() {
 
 	// Give outbound calls a moment to drain.
 	time.Sleep(200 * time.Millisecond)
+}
+
+// orDev renders a build-metadata field, falling back to a placeholder so an
+// unstamped local build is recognisable in the logs.
+func orDev(s string) string {
+	if s == "" {
+		return "(not stamped)"
+	}
+	return s
 }

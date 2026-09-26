@@ -2,17 +2,37 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [master]
+    paths:
+      - '**.go'
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/**
   pull_request:
+  # Manual pre-release build. Run it from the Actions tab when you want a
+  # tagged, checksummed artifact set rather than just a test pass.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for ldflags and artifact names (e.g. 0.1.0)'
+        required: false
+        default: ''
+
+# Single-branch checkout is enough: no history-dependent step uses it.
+permissions:
+  contents: read
 
 jobs:
-  build:
+  # ---- 1. lint/test on push & PR ----------------------------------------
+  test:
+    name: test / go ${{ matrix.go }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         go: ['1.22.x', '1.26.x']
         os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -21,8 +41,19 @@ jobs:
           go-version: ${{ matrix.go }}
           cache: true
 
-      - name: Tidy
-        run: go mod tidy
+      - name: Verify gofmt
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
 
       - name: Vet
         run: go vet ./...
@@ -30,12 +61,50 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Build
-        run: go build -o feishubridge ./cmd/feishubridge
+      - name: Build (host)
+        run: make build
 
-      - name: Upload binary
-        if: matrix.go == '1.26.x'
-        uses: actions/upload-artifact@v4
+  # ---- 2. release: full matrix + GitHub Release -------------------------
+  # Only runs on workflow_dispatch. Kept separate so an ordinary push does not
+  # spend 6 cross-compiles just to produce artifacts nobody asked for.
+  release:
+    name: release
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # creating a GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
-          name: feishubridge-${{ matrix.os }}-go${{ matrix.go }}
-          path: feishubridge*
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Build matrix
+        run: |
+          # env blocks do not see each other, so carry the tag in the shell.
+          TAG="${{ inputs.version }}"
+          TAG="${TAG:-manual-$(date -u +%Y%m%d%H%M)}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          make release VERSION="$TAG"
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum feishubridge-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+        run: |
+          # TAG was written to $GITHUB_ENV by the Build matrix step.
+          # Drop a prior release of the same tag so a re-run is idempotent.
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" \
+            --title "feishubridge $TAG" \
+            --notes "Build of commit ${{ github.sha }}" \
+            --generate-notes \
+            dist/feishubridge-* dist/checksums.txt
+          echo "released $TAG"

@@ -1,11 +1,18 @@
-// Package bridge wires the Feishu client, the persistent PowerShell session
-// and the Claude Code agent together.
+// Package bridge wires the Feishu client, the per-chat working directory and
+// the Claude Code agent together.
+//
+// The directory layer is deliberately small: it remembers a cwd per chat so
+// /cd carries over into later /ls calls and into the agent's working
+// directory. It does not run a shell process, so it needs no external shell
+// binary and builds the same on every architecture.
 package bridge
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +21,6 @@ import (
 	"feishubridge/internal/card"
 	"feishubridge/internal/config"
 	"feishubridge/internal/feishu"
-	"feishubridge/internal/shell"
 )
 
 // Bridge is the top-level coordinator.
@@ -23,29 +29,16 @@ type Bridge struct {
 	cli *feishu.Client
 	log *log.Logger
 
-	// shells and sessions are keyed by (botID, chatID) and by
-	// (botID, chatID, threadID) respectively.
-	mu     sync.Mutex
-	shells map[string]*chatShell
-	// shellLocks serialises first-touch creation of each chat's shell.
-	shellLocks map[string]*sync.Mutex
+	// cwds is keyed by (botID, chatID): the directory the user has /cd'd to.
+	// dirs and sessions are keyed the same way.
+	mu         sync.Mutex
+	cwds       map[string]string
 	store      *sessionStore
-	reaper     *reaper
 	sessReaper *reaper
 	// inflight tracks turns currently running, so /stop can cancel them.
 	inflight map[string]*turn
 
 	startedAt time.Time
-}
-
-// chatShell is layer 1: one pwsh per chat.
-type chatShell struct {
-	*shell.Shell
-	Cwd string
-
-	// lastSeen is the most recent time this chat asked for anything. It is
-	// written under mu and read by the reaper under mu, so no atomic needed.
-	lastSeen time.Time
 }
 
 // session is layer 2: one Claude conversation per thread.
@@ -75,15 +68,13 @@ func New(cfg *config.Config, cli *feishu.Client, logger *log.Logger) *Bridge {
 		logger = log.Default()
 	}
 	b := &Bridge{
-		cfg:        cfg,
-		cli:        cli,
-		log:        logger,
-		shells:     make(map[string]*chatShell),
-		shellLocks: make(map[string]*sync.Mutex),
-		inflight:   make(map[string]*turn),
+		cfg:      cfg,
+		cli:      cli,
+		log:      logger,
+		cwds:     make(map[string]string),
+		inflight: make(map[string]*turn),
 	}
 	b.store = newSessionStore(cfg.Bots[0].Workspace, logger.Printf)
-	b.reaper = newReaper(cfg.Stream.ShellIdleSec, logger.Printf)
 	b.sessReaper = newReaper(cfg.Stream.SessionIdleSec, logger.Printf)
 
 	cli.SetHandlers(&feishu.EventHandlers{
@@ -97,10 +88,7 @@ func New(cfg *config.Config, cli *feishu.Client, logger *log.Logger) *Bridge {
 func (b *Bridge) Run(ctx context.Context) error {
 	b.startedAt = time.Now()
 
-	// Idle shell reaping runs alongside the websocket loop. See reaper below.
-	go b.reaper.Run(ctx, b.collectIdleShells, b.stopIdle)
-
-	// Session records are reaped independently: they carry no process, so no
+	// Session records are reaped on an interval: they carry no process, so no
 	// per-chat lock is needed and the cutoff is much longer. See sessions.go.
 	go b.sessReaper.Run(ctx, b.collectIdleSessions, b.stopIdleSessions)
 
@@ -118,8 +106,8 @@ func (b *Bridge) collectIdleSessions() []string {
 	return keys
 }
 
-// stopIdleSessions drops stale session records and persists. Unlike shell
-// reaping there is no process and no per-chat lock to acquire.
+// stopIdleSessions drops stale session records and persists. There is no
+// process to stop and no per-chat lock to acquire.
 func (b *Bridge) stopIdleSessions(ctx context.Context, keys []string) {
 	if len(keys) == 0 {
 		return
@@ -128,63 +116,9 @@ func (b *Bridge) stopIdleSessions(ctx context.Context, keys []string) {
 	if n == 0 {
 		return
 	}
-	b.log.Printf("reaper: dropped %d idle Claude session record(s) (idle>%s)",
+	b.log.Printf("reaper: dropped %d idle session record(s) (idle>%s)",
 		n, b.sessReaper.cutoff())
 	b.store.Save()
-}
-
-// collectIdleShells reports shell keys idle beyond the configured threshold.
-// Called with mu held; must not block or recurse into stopIdle.
-func (b *Bridge) collectIdleShells() []string {
-	cutoff := b.reaper.cutoff()
-	if cutoff <= 0 {
-		return nil // reaping disabled
-	}
-	var idle []string
-	for key, cs := range b.shells {
-		if time.Since(cs.lastSeen) > cutoff {
-			idle = append(idle, key)
-		}
-	}
-	return idle
-}
-
-// stopIdle tears down each idle shell and records its cwd so a later restart
-// knows where the user left off.
-//
-// It re-acquires the per-chat creation lock for every victim, matching how
-// ensureShell does it. Without that a restart racing a stop could observe the
-// map entry, find the process gone, and start a second process against the
-// same chat.
-func (b *Bridge) stopIdle(ctx context.Context, keys []string) {
-	for _, key := range keys {
-		b.mu.Lock()
-		cs, ok := b.shells[key]
-		delete(b.shells, key)
-		clk := b.shellLocks[key]
-		b.mu.Unlock()
-
-		if !ok || clk == nil {
-			continue
-		}
-		clk.Lock()
-		if cs.Shell.Started() {
-			b.log.Printf("reaper: stopping idle shell %s (cwd=%s, idle>%s)",
-				shortKey(key), cs.Cwd, b.reaper.cutoff())
-			// Snapshot cwd+env before the process goes so a restart can pick
-			// up where the user left off. Best effort: a failed snapshot still
-			// leaves the user with a working shell, just at the workspace root.
-			snapCtx, snapCancel := context.WithTimeout(ctx, 15*time.Second)
-			if err := cs.Shell.SnapshotState(snapCtx); err != nil {
-				b.log.Printf("reaper: snapshot shell %s: %v", shortKey(key), err)
-			}
-			snapCancel()
-			if err := cs.Shell.Stop(); err != nil {
-				b.log.Printf("reaper: stop shell %s: %v", shortKey(key), err)
-			}
-		}
-		clk.Unlock()
-	}
 }
 
 // ---- inbound -------------------------------------------------------------
@@ -238,21 +172,26 @@ func (b *Bridge) handleCommand(ctx context.Context, bot *config.BotConfig, m *fe
 	case "/help", "/h":
 		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "命令列表", helpText, standardButtons(bot, m)...))
 	case "/pwd":
-		return b.handleShellCommand(ctx, bot, m, "Get-Location -LiteralPath")
+		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "目录",
+			fmt.Sprintf("```\n%s\n```\n\n后续 /ls 与 Claude 会话都以此为工作目录。",
+				b.currentCwd(bot, m)), standardButtons(bot, m)...))
 	case "/cd":
 		if rest == "" {
 			return b.replyCard(ctx, m, card.Error(bot.DisplayName, "用法: /cd <路径>"))
 		}
-		return b.handleShellCommand(ctx, bot, m, fmt.Sprintf("Set-Location -LiteralPath %s", quotePath(rest)))
-	case "/ls":
-		return b.handleShellCommand(ctx, bot, m, "Get-ChildItem -Force | Select-Object Mode, Length, Name | Format-Table -AutoSize | Out-String -Width 200")
-	case "/ps":
-		// Escape hatch for arbitrary PowerShell. Runs in the same persistent
-		// session as /cd and /ls, so state carries over.
-		if rest == "" {
-			return b.replyCard(ctx, m, card.Error(bot.DisplayName, "用法: /ps <PowerShell 命令>"))
+		if _, err := b.chdir(bot, m, rest); err != nil {
+			return b.replyCard(ctx, m, card.Error(bot.DisplayName, fmt.Sprintf("```\n%v\n```", err)))
 		}
-		return b.handleShellCommand(ctx, bot, m, rest)
+		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "已切换目录",
+			fmt.Sprintf("```\n%s\n```\n\n后续 /ls 与 Claude 会话都以此为工作目录。",
+				b.currentCwd(bot, m)), standardButtons(bot, m)...))
+	case "/ls":
+		out, err := b.listDir(bot, m)
+		if err != nil {
+			return b.replyCard(ctx, m, card.Error(bot.DisplayName, fmt.Sprintf("```\n%v\n```", err)))
+		}
+		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, b.currentCwd(bot, m),
+			"```\n"+out+"\n```", standardButtons(bot, m)...))
 	case "/new", "/reset":
 		b.resetSession(bot.ID, m.ChatID, m.ThreadID)
 		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "新会话", "已开启新的 Claude 会话。"))
@@ -261,8 +200,6 @@ func (b *Bridge) handleCommand(ctx context.Context, bot *config.BotConfig, m *fe
 		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "已停止", "已请求取消当前任务。"))
 	case "/status":
 		return b.handleStatus(ctx, bot, m)
-	case "/clear":
-		return b.handleShellCommand(ctx, bot, m, "Clear-Host; Write-Host 'cleared'")
 	case "/model":
 		if rest == "" {
 			model := b.cfg.Agent.Model
@@ -277,58 +214,96 @@ func (b *Bridge) handleCommand(ctx context.Context, bot *config.BotConfig, m *fe
 	}
 }
 
-// ---- shell-layer commands ------------------------------------------------
+// ---- directory layer -----------------------------------------------------
+//
+// The working directory is the only per-chat mutable state. It is a plain
+// string in a map, so there is no process to start, stop, snapshot or reap,
+// and /cd survives a bridge restart for the lifetime of the process.
 
-func (b *Bridge) handleShellCommand(ctx context.Context, bot *config.BotConfig, m *feishu.Message, script string) error {
-	sh, err := b.ensureShell(ctx, bot.ID, m.ChatID)
-	if err != nil {
-		return b.replyCard(ctx, m, card.Error(bot.DisplayName, fmt.Sprintf("shell 错误: %v", err)))
+// cwdKey joins bot and chat into the key used for the cwd table.
+func cwdKey(botID, chatID string) string { return botID + "/" + chatID }
+
+// currentCwd returns the chat's working directory, falling back to the bot's
+// configured workspace when the user has not /cd'd yet.
+func (b *Bridge) currentCwd(bot *config.BotConfig, m *feishu.Message) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if d, ok := b.cwds[cwdKey(bot.ID, m.ChatID)]; ok && d != "" {
+		return d
 	}
-	b.touch(sh)
-	out, err := sh.Run(ctx, script)
-	if out != "" {
-		out = card.Sanitize(strings.TrimSpace(out))
+	return bot.Workspace
+}
+
+// chdir resolves the target and records it as the chat's working directory.
+// Only existing directories are accepted, so /cd into a typo cannot silently
+// strand later /ls calls.
+func (b *Bridge) chdir(bot *config.BotConfig, m *feishu.Message, target string) (string, error) {
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(b.currentCwd(bot, m), target)
 	}
+	info, err := os.Stat(target)
 	if err != nil {
-		text := out
-		if text == "" {
-			text = err.Error()
+		return "", fmt.Errorf("路径不存在: %s", target)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("不是目录: %s", target)
+	}
+	b.mu.Lock()
+	b.cwds[cwdKey(bot.ID, m.ChatID)] = target
+	b.mu.Unlock()
+	return target, nil
+}
+
+// listDir renders the chat's working directory. Output is capped so a huge
+// directory cannot blow past the card size limit.
+func (b *Bridge) listDir(bot *config.BotConfig, m *feishu.Message) (string, error) {
+	dir := b.currentCwd(bot, m)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	const maxLines = 150
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%-5s %12s  %s\n", "DRW", "SIZE", "NAME"))
+	for i, e := range ents {
+		if i >= maxLines {
+			sb.WriteString(fmt.Sprintf("… 还有 %d 项\n", len(ents)-maxLines))
+			break
 		}
-		return b.replyCard(ctx, m, card.Error(bot.DisplayName, "```\n"+text+"\n```"))
+		size := ""
+		if !e.IsDir() {
+			if fi, err := e.Info(); err == nil {
+				size = fmt.Sprintf("%d", fi.Size())
+			}
+		}
+		name := e.Name()
+		if e.IsDir() {
+			name += "/"
+		}
+		perm := ""
+		if e.Type().IsDir() {
+			perm = "d"
+		}
+		sb.WriteString(fmt.Sprintf("  %s %12s  %s\n", perm, size, name))
 	}
-	if out == "" {
-		out = "_（无输出）_"
-	}
-	return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, bot.Shell, "```\n"+out+"\n```", standardButtons(bot, m)...))
+	return sb.String(), nil
 }
 
 func (b *Bridge) handleStatus(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
-	key := m.ChatID
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("**运行时间**: %s\n\n", time.Since(b.startedAt).Round(time.Second)))
 
-	sh, ok := b.shells[key]
-	if ok && sh.Shell.Started() {
-		sb.WriteString(fmt.Sprintf("**Shell**: %s\n", bot.Shell))
-		if sh.Cwd != "" {
-			sb.WriteString(fmt.Sprintf("**当前目录**: `%s`\n", sh.Cwd))
-		}
-		sb.WriteString(fmt.Sprintf("**最后活动**: %s 前\n", time.Since(sh.lastSeen).Round(time.Second)))
-		if b.reaper.cutoff() > 0 {
-			sb.WriteString(fmt.Sprintf("（闲置 %s 后自动回收）\n", b.reaper.cutoff()))
-		}
-	} else {
-		sb.WriteString("**Shell**: 未启动（首次命令时创建）\n")
-		if sh != nil && sh.Cwd != "" {
-			sb.WriteString(fmt.Sprintf("上次停止前目录: `%s`\n", sh.Cwd))
-		}
+	dir := bot.Workspace
+	if d, ok := b.cwds[cwdKey(bot.ID, m.ChatID)]; ok && d != "" {
+		dir = d
 	}
+	sb.WriteString(fmt.Sprintf("**工作目录**: `%s`\n\n", dir))
 
 	if s := b.store.Get(bot.ID, m.ChatID, m.ThreadID); s != nil {
-		sb.WriteString(fmt.Sprintf("\n**Claude 会话**: %s\n", shortID(string(s.ID))))
+		sb.WriteString(fmt.Sprintf("**Claude 会话**: %s\n", shortID(string(s.ID))))
 		sb.WriteString(fmt.Sprintf("**已处理轮次**: %d\n", s.Turns))
 		sb.WriteString(fmt.Sprintf("**最后活动**: %s 前\n", time.Since(s.LastSeen).Round(time.Second)))
 		if b.sessReaper.cutoff() > 0 {
@@ -359,30 +334,9 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 		resume = string(s.ID)
 	}
 
-	// Ensure the shell is alive so the agent inherits the user's cwd.
-	sh, err := b.ensureShell(ctx, bot.ID, m.ChatID)
-	if err != nil {
-		b.log.Printf("shell ensure failed, falling back to workspace: %v", err)
-	}
-	workspace := bot.Workspace
-	if sh != nil {
-		b.touch(sh)
-		// Resolve the shell's current directory so the agent inherits the
-		// user's cwd rather than the bot's configured workspace.
-		cwdCtx, cwdCancel := context.WithTimeout(ctx, 5*time.Second)
-		cwd, e := sh.Run(cwdCtx, "(Get-Location -LiteralPath).Path")
-		cwdCancel()
-		if e == nil {
-			if cwd = strings.TrimSpace(cwd); cwd != "" {
-				workspace = cwd
-				b.mu.Lock()
-				sh.Cwd = cwd
-				b.mu.Unlock()
-			}
-		} else {
-			b.log.Printf("cwd lookup failed, using workspace: %v", e)
-		}
-	}
+	// The agent inherits the user's cwd so it lands where /cd left the user,
+	// not at the bot's configured workspace.
+	workspace := b.currentCwd(bot, m)
 
 	// Track the in-flight turn so /stop can cancel it.
 	turnCtx, cancel := context.WithCancel(ctx)
@@ -489,69 +443,6 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 }
 
 // ---- helpers -------------------------------------------------------------
-
-// ensureShell returns the chat's persistent shell, creating it if needed.
-//
-// ensureShell returns the chat's persistent shell, creating it if needed.
-//
-// It uses a per-chat creation lock so two concurrent first-touches cannot
-// both start a process; the second caller picks up the first's result.
-func (b *Bridge) ensureShell(ctx context.Context, botID, chatID string) (*chatShell, error) {
-	key := chatID
-	b.mu.Lock()
-	if cs, ok := b.shells[key]; ok && cs.Shell.Started() {
-		b.mu.Unlock()
-		return cs, nil
-	}
-	if _, ok := b.shellLocks[key]; !ok {
-		b.shellLocks[key] = &sync.Mutex{}
-	}
-	clk := b.shellLocks[key]
-	b.mu.Unlock()
-
-	clk.Lock()
-	defer clk.Unlock()
-
-	// Re-check under the per-chat lock.
-	b.mu.Lock()
-	if cs, ok := b.shells[key]; ok && cs.Shell.Started() {
-		b.mu.Unlock()
-		return cs, nil
-	}
-	b.mu.Unlock()
-
-	boot := b.cfg.FindBot(botID)
-	if boot == nil {
-		return nil, fmt.Errorf("no bot %q", botID)
-	}
-
-	cs := &chatShell{Shell: shell.New(shell.Config{
-		Bin:             boot.Shell,
-		Workspace:       boot.Workspace,
-		Timeout:         60 * time.Second,
-		ShutdownTimeout: 5 * time.Second,
-		SnapshotDir:     boot.Workspace,
-	}, b.log.Printf)}
-	if err := cs.Shell.Start(ctx); err != nil {
-		return nil, err
-	}
-
-	b.mu.Lock()
-	cs.lastSeen = time.Now()
-	b.shells[key] = cs
-	b.mu.Unlock()
-	return cs, nil
-}
-
-// touch marks a shell as recently used, pushing it past the reaper cutoff.
-//
-// Cheap enough to call from the hot path; it also records the last cwd seen
-// so a reaped-and-restarted shell reports where it was before it went idle.
-func (b *Bridge) touch(cs *chatShell) {
-	b.mu.Lock()
-	cs.lastSeen = time.Now()
-	b.mu.Unlock()
-}
 
 func (b *Bridge) patchOrSend(ctx context.Context, m *feishu.Message, msgID string, c map[string]any) {
 	if msgID != "" {
@@ -735,10 +626,6 @@ func shortID(s string) string {
 		return s[:8] + "…"
 	}
 	return s
-}
-
-func quotePath(p string) string {
-	return "'" + strings.ReplaceAll(p, "'", "''") + "'"
 }
 
 func orDefault(s, d string) string {

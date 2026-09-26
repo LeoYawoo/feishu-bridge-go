@@ -40,27 +40,27 @@ type AgentConfig struct {
 	SettingSrc string `json:"setting_sources"`
 }
 
-// BotConfig is one named bot: its own workspace, shell, and ACL.
+// BotConfig is one named bot: its own workspace and ACL.
 type BotConfig struct {
-	ID           string   `json:"id"`
-	DisplayName  string   `json:"display_name"`
-	Workspace    string   `json:"workspace"`
-	Shell        string   `json:"shell"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	Workspace   string `json:"workspace"`
+	// Shell is accepted for backwards compatibility with older config files but
+	// is unused: the bridge no longer spawns a shell process, so this field is
+	// parsed and dropped. DisallowUnknownFields would otherwise reject it.
+	Shell        string   `json:"shell,omitempty"`
 	AllowedUsers []string `json:"allowed_users"`
 	GroupMode    string   `json:"group_mode"`
 	OwnerOpenID  string   `json:"owner_open_id"`
 	ExtraCLIArgs []string `json:"extra_cli_args"`
 }
 
-// StreamCfg controls card streaming and shell lifecycle behaviour.
+// StreamCfg controls card streaming and session lifecycle behaviour.
 type StreamCfg struct {
 	ThrottleMs   int `json:"throttle_ms"`
 	MaxCardBytes int `json:"max_card_bytes"`
 	MaxDivChars  int `json:"max_div_chars"`
-	// ShellIdleSec stops a chat's pwsh after this much silence. 0 disables.
-	ShellIdleSec int `json:"shell_idle_seconds"`
 	// SessionIdleSec drops a Claude session record after this much silence.
-	// Longer than shell idle: a session is cheap while a pwsh process is not.
 	SessionIdleSec int `json:"session_idle_seconds"`
 }
 
@@ -152,12 +152,9 @@ func (c *Config) normalize() error {
 	if c.Stream.MaxDivChars <= 0 {
 		c.Stream.MaxDivChars = 10000
 	}
-	if c.Stream.ShellIdleSec < 0 {
-		c.Stream.ShellIdleSec = 0
-	}
 	if c.Stream.SessionIdleSec <= 0 {
-		// One week. A session is cheap while a pwsh process is not, so this
-		// is much longer than the shell threshold.
+		// One week. Session records are cheap to keep but stale ones confuse
+		// /status, so cap how long a quiet chat can hold one.
 		c.Stream.SessionIdleSec = 7 * 24 * 3600
 	}
 
@@ -174,9 +171,6 @@ func (c *Config) normalize() error {
 
 		if b.DisplayName == "" {
 			b.DisplayName = b.ID
-		}
-		if b.Shell == "" {
-			b.Shell = "pwsh"
 		}
 		if b.Workspace == "" {
 			b.Workspace = c.WorkDir

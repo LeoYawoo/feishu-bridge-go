@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -11,6 +12,63 @@ import (
 )
 
 const sessionsFile = ".feishu-bridge-sessions.json"
+
+// ---- idle reaping --------------------------------------------------------
+
+// ReaperIntervalSec is how often the reaper sweeps.
+const ReaperIntervalSec = 60
+
+// reaper runs a collect/stop pair on a fixed interval. It holds no state of
+// its own; the bridge supplies both callbacks, so the reaper never touches
+// the maps it does not own. Session records are its only current caller, but
+// the shape generalises: it is just a periodic two-step sweep.
+type reaper struct {
+	idle time.Duration
+	logf func(format string, args ...any)
+}
+
+func newReaper(idleSec int, logf func(string, ...any)) *reaper {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	return &reaper{idle: time.Duration(idleSec) * time.Second, logf: logf}
+}
+
+// cutoff is the idle threshold, read by the collect callback.
+func (r *reaper) cutoff() time.Duration { return r.idle }
+
+// Run sweeps until ctx is cancelled.
+func (r *reaper) Run(ctx context.Context, collect func() []string, stop func(context.Context, []string)) {
+	r.logf("idle reaper: stopping records idle over %s, every %s",
+		r.idle, time.Duration(ReaperIntervalSec)*time.Second)
+
+	t := time.NewTicker(time.Duration(ReaperIntervalSec) * time.Second)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			keys := collect()
+			if len(keys) == 0 {
+				continue
+			}
+			r.logf("reaper: %d record(s) idle over %s, stopping", len(keys), r.idle)
+			stop(ctx, keys)
+		}
+	}
+}
+
+// shortKey trims a key for log lines.
+func shortKey(k string) string {
+	if len(k) > 24 {
+		return k[:24] + "…"
+	}
+	return k
+}
+
+// ---- session store -------------------------------------------------------
 
 // sessionStore is the session table, its reverse index and persistence.
 //

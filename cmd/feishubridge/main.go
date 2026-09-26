@@ -1,4 +1,4 @@
-// Command feishubridge is the Feishu <-> PowerShell <-> Claude Code bridge.
+// Command feishubridge is the Feishu <-> Claude Code bridge.
 //
 // Usage:
 //
@@ -6,7 +6,6 @@
 //
 // Requires:
 //   - a Feishu bot with "机器人接收消息" and "卡片回调" enabled
-//   - PowerShell Core (pwsh) on PATH
 //   - Claude Code (claude) on PATH
 package main
 
@@ -75,8 +74,8 @@ func main() {
 	// at a glance whether the wrong bot/workspace was picked up.
 	for i := range cfg.Bots {
 		boot := &cfg.Bots[i]
-		logger.Printf("  bot %s: workspace=%s shell=%s group_mode=%s users=%v",
-			boot.ID, boot.Workspace, boot.Shell, boot.GroupMode, boot.AllowedUsers)
+		logger.Printf("  bot %s: workspace=%s group_mode=%s users=%v",
+			boot.ID, boot.Workspace, boot.GroupMode, boot.AllowedUsers)
 	}
 
 	if err := b.Run(ctx); err != nil {

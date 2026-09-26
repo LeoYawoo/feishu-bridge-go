@@ -19,7 +19,7 @@ func isBridgeCommand(text string) bool {
 	}
 	switch first[0] {
 	case "/help", "/h", "/new", "/reset", "/stop", "/cancel",
-		"/status", "/pwd", "/cd", "/ls", "/ps", "/clear", "/model":
+		"/status", "/pwd", "/cd", "/ls", "/model":
 		return true
 	}
 	return false
@@ -32,18 +32,16 @@ const helpText = `**会话控制**
 - /status — 查看 shell、会话与运行时间
 - /model [名称] — 查看或切换模型
 
-**目录与 Shell**（在常驻 pwsh 会话中执行）
-- /pwd — 当前目录
-- /cd <路径> — 切换目录
+**目录**（本进程内记录，无需外部 shell）
+- /pwd — 当前工作目录
+- /cd <路径> — 切换目录（相对路径基于当前目录）
 - /ls — 列出文件
-- /ps <命令> — 执行任意 PowerShell 命令
-- /clear — 清空输出
 
 **其他**
 - /help — 本帮助
 
 其他任意消息都会作为提示词发送给 Claude。
-所有目录命令都在同一个常驻 pwsh 会话中执行，/cd 切换的目录对后续命令和 Claude 会话都生效。`
+/cd 切换的目录对后续命令和 Claude 会话都生效；它只记录在本进程内存里，重启后回到默认工作目录。`
 
 // standardButtons returns the action buttons appended to most cards.
 func standardButtons(bot *config.BotConfig, m *feishu.Message) []card.Button {

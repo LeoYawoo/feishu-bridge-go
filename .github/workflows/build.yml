@@ -28,6 +28,9 @@ jobs:
   test:
     name: test / go ${{ matrix.go }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Windows runners default to pwsh; these steps are bash. Bash is installed
+    # on both runners, so pin it rather than rewriting the scripts per-OS.
+    shell: bash
     strategy:
       fail-fast: false
       matrix:

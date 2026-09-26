@@ -23,10 +23,36 @@ import (
 	"feishubridge/internal/feishu"
 )
 
+// feishuSender is the slice of feishu.Client that Bridge actually calls.
+// Defined here (rather than in feishu) because it is a bridge-side concern:
+// feishu.Client satisfies it structurally, but tests can supply a fake
+// without a websocket.
+type feishuSender interface {
+	SendCard(ctx context.Context, chatID string, card map[string]any) (string, error)
+	SendCardInThread(ctx context.Context, chatID, threadID string, card map[string]any) (string, error)
+	PatchCard(ctx context.Context, messageID string, card map[string]any) error
+	ReplyCard(ctx context.Context, sourceMessageID string, card map[string]any, thread bool) (string, error)
+	ReplyCardThreaded(ctx context.Context, sourceMessageID string, card map[string]any, thread bool) (messageID, threadID string, err error)
+	StartWS(ctx context.Context) error
+}
+
+// agentRunner is the shape of agent.Run. A single-method interface so tests
+// can stub it without invoking a real `claude` subprocess.
+type agentRunner interface {
+	Run(ctx context.Context, cfg agent.Config, prompt string, resume agent.SessionID, onEvent func(agent.Event)) (*agent.Result, error)
+}
+
+// realAgentRunner adapts the package-level agent.Run to the interface.
+type realAgentRunner struct{}
+
+func (realAgentRunner) Run(ctx context.Context, cfg agent.Config, prompt string, resume agent.SessionID, onEvent func(agent.Event)) (*agent.Result, error) {
+	return agent.Run(ctx, cfg, prompt, resume, onEvent)
+}
+
 // Bridge is the top-level coordinator.
 type Bridge struct {
 	cfg *config.Config
-	cli *feishu.Client
+	cli feishuSender
 	log *log.Logger
 
 	// cwds is keyed by (botID, chatID): the directory the user has /cd'd to.
@@ -39,6 +65,9 @@ type Bridge struct {
 	// next to the session table. The console card reads it (step 9); newTopic
 	// pushes into it now so the LRU is populated as soon as /new lands.
 	recentDirs *recentDirsStore
+	// runAgent is the entry point into the claude subprocess. Production
+	// uses realAgentRunner; tests can swap in a stub that never shells out.
+	runAgent agentRunner
 	// inflight tracks turns currently running, so /stop can cancel them.
 	inflight map[string]*turn
 
@@ -77,6 +106,7 @@ func New(cfg *config.Config, cli *feishu.Client, logger *log.Logger) *Bridge {
 		log:      logger,
 		cwds:     make(map[string]string),
 		inflight: make(map[string]*turn),
+		runAgent: realAgentRunner{},
 	}
 	b.store = newSessionStore(cfg.Bots[0].Workspace, logger.Printf)
 	b.sessReaper = newReaper(cfg.Stream.SessionIdleSec, logger.Printf)
@@ -410,7 +440,7 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 	var latestEv agent.Event
 
 	started := time.Now()
-	res, err := agent.Run(turnCtx, cfg, text, agent.SessionID(resume), func(ev agent.Event) {
+	res, err := b.runAgent.Run(turnCtx, cfg, text, agent.SessionID(resume), func(ev agent.Event) {
 		latestEv = ev
 		switch ev.Type {
 		case "stream_event", "assistant":

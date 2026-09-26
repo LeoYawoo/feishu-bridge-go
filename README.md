@@ -1,46 +1,51 @@
 # feishubridge
 
-基于飞书 Golang SDK 的消息桥接：**飞书 WebSocket → 常驻 PowerShell → Claude Code**。
+基于飞书 Golang SDK 的消息桥接：**飞书 WebSocket → Claude Code**。
 
-在飞书里就能进入目录、切换工作区、运行 `claude` / `codex`，并通过飞书消息与
-会话交互。卡片流式更新（打字机效果），底部带交互按钮。
+在飞书里就能查看/切换工作目录、运行 `claude` / `codex`，并通过飞书消息与会话
+交互。卡片流式更新（打字机效果），底部带交互按钮。
 
-参考实现: `feishu-bridge/`（Python 版，19955 行）。本实现只保留核心路径，
-约 1500 行 Go。
+参考实现: `feishu-bridge/`（Python 版）。本实现只保留核心路径，
+约 1200 行 Go，无 cgo 依赖。
 
 ## 架构
 
-两层状态，对应你的需求：
+两层状态：
 
 ```
 飞书消息（chat + thread 话题）
         │
         ▼
 ┌─────────────────────────────┐
-│ Layer 1: 常驻 pwsh 进程        │  ← 每个 chat 一个
-│   /pwd /cd /ls /clear        │     cd、env、alias 跨消息保留
-│   ps <任意 PowerShell 命令>    │
+│ Layer 1: 工作目录             │  ← 每个 chat 一个
+│   /pwd /cd /ls              │     纯 Go 内存记录，不起进程
 └──────────────┬──────────────┘
                │ 继承当前 cwd
                ▼
 ┌─────────────────────────────┐
-│ Layer 2: Claude Code 会话      │  ← 每个 chat+thread 一个
-│   claude -p --resume <id>    │     JSON 流式输出
-│   保留 CLAUDE.md / hooks /    │     --resume 续接同一会话
+│ Layer 2: Claude Code 会话     │  ← 每个 chat+thread 一个
+│   claude -p --resume <id>   │     JSON 流式输出
+│   保留 CLAUDE.md / hooks /   │     --resume 续接同一会话
 │   skills（同一 claude 二进制） │
 └─────────────────────────────┘
 ```
 
-飞书「话题（thread）」→ Claude 会话；飞书「聊天（chat）」→ PowerShell 会话。
+飞书「话题（thread）」→ Claude 会话；飞书「聊天（chat）」→ 工作目录。
 私聊没有 thread，退化为一个会话。
+
+**为什么不起 shell 进程**：`/pwd`、`/cd`、`/ls` 就是 `os.Getwd` / `os.ReadDir`，
+标准库一行搞定。早期版本每个 chat 起一个常驻 `pwsh` 来跑 `Get-Location`
+和 `Get-ChildItem`，代价是要求 `pwsh` 在 PATH 上、400 行进程管理代码、
+每 30 分钟回收一次的 reaper，还引入一个跨 arch 不成立的外部依赖。现在
+cwd 只是内存里的一个字符串，跨平台天然成立。
 
 ## 前置条件
 
 - Go 1.22+
-- PowerShell 7 (`pwsh`) 在 PATH 中（Windows 10 自带的是 5.1 `powershell`，也可用，
-  见配置 `shell` 字段）
-- Claude Code (`claude`) 在 PATH 中
+- Claude Code (`claude`) 在 PATH 中（`codex` 也可以）
 - 飞书开放平台机器人，已开启「机器人接收消息」与「卡片回调」能力
+
+**不需要** PowerShell。
 
 ## 安装
 
@@ -112,14 +117,14 @@ $env:FEISHU_APP_SECRET = "xxx"
 | `agent.timeout_seconds` | 单次会话硬超时（默认 300） |
 | `agent.append_system_prompt` | 追加到系统提示词 |
 | `bots[]` | 多 bot 列表，每个独立 workspace + ACL |
-| `bots[].shell` | `pwsh` / `powershell` / 绝对路径 |
 | `bots[].allowed_users` | open_id 白名单，`["*"]` 放行全部 |
 | `bots[].group_mode` | `disabled` / `mention-all` / `owner-only` |
 | `bots[].owner_open_id` | 机器人自己的 open_id，群聊 @ 判定用它（见下） |
 | `bot_chats` | `chat_id` → `bot id` 映射，多 bot 时必填（见下） |
 | `streaming.throttle_ms` | 卡片流式更新间隔（默认 800ms） |
-| `streaming.shell_idle_seconds` | pwsh 闲置多久后回收（默认 1800s，`0` 禁用） |
 | `streaming.session_idle_seconds` | Claude 会话记录闲置多久后丢弃（默认 604800s = 7 天） |
+
+`bots[].shell` 仍能被解析（老配置不报错）但被忽略，可以删掉。
 
 ### 关于 `bot_chats`
 
@@ -127,10 +132,9 @@ $env:FEISHU_APP_SECRET = "xxx"
 消息里没有任何信号能说明这个会话属于哪个工作区，所以必须由你显式声明。
 
 - 未映射的 `chat_id` **不会** fallback 到第一个 bot，而是直接丢弃并记日志。
-  多 bot 场景下每个 bot 有自己的 workspace、常驻 shell 和凭证，猜错比不响应危险。
+  多 bot 场景下每个 bot 有自己的 workspace 和凭证，猜错比不响应危险。
 - `bot_chats` 里的 `bot id` 写错会在启动时报配置错误，不会静默走兜底。
 - 取 `chat_id`：把 bot 拉进目标群，发任意消息，日志里的 `ChatID` 字段就是。
-
 
 ### 关于 `owner_open_id`
 
@@ -147,24 +151,12 @@ open_id；或者在飞书开放平台的"凭证与基础信息"页查。
 结果卡片底部有「新会话 / 停止 / 状态 / 帮助」四个按钮，点击等价于输入对应
 命令，并且只在被点击人通过 `allowed_users` 校验时才生效。
 
-### Shell 闲置回收
+### 工作目录
 
-每个聊天的 pwsh 是常驻进程，长时间运行会累积。默认每 60 秒扫一次，闲置超过
-`shell_idle_seconds`（默认 30 分钟）的会话会被回收。
-
-**回收时保存什么**：cwd 和 `$env:` 变量写入 `<workspace>/.feishu-bridge-shell.json`，
-复活时回放。`/cd` 切过的目录和 `$env:FOO="bar"` 都会恢复。
-
-**回收后拿不回来的**：PowerShell 没有把活会话序列化的能力，所以 `$function:`、
-alias、scriptblock、已 import 的模块状态全部丢失。这是语言限制，不是实现取舍。
-
-- Claude 会话不受影响。`sessions` 里存的是 `session_id`，靠 `--resume` 续，
-  完全不依赖 pwsh 进程活着。
-- 回收是优雅退出：先关 stdin 让 pwsh 读到 EOF 自然结束，5 秒超时才 Kill。
-- 回收后下一条命令透明重拉 pwsh 并回放快照，无需人工干预。
-- 快照文件被消费后删除，不会重复回放。
-- 设为 `0` 关闭回收。
-- `/status` 会显示当前目录、最后活动时间，以及回收阈值。
+`/cd` 记录的目录只存在进程内存里，**bridge 重启后回到默认 workspace**。
+这是取舍：进程内的状态重启必然丢失，而持久化它需要一套写入/恢复/校验的
+代码，对一个目录值来说不值当。Claude 会话记录有持久化（见下），因为
+`session_id` 的价值高得多。
 
 ### Claude 会话持久化
 
@@ -184,7 +176,6 @@ alias、scriptblock、已 import 的模块状态全部丢失。这是语言限�
 ——飞书长连接会被抢占。多机部署的正确做法是每台机器一个飞书应用，各自配
 `bot_chats` 指向自己负责的群，天然隔离。
 
-
 ## 运行
 
 ```bash
@@ -196,34 +187,32 @@ feishubridge -config ~/.config/feishu-bridge/config.json -loglevel debug
 | 命令 | 作用 |
 |---|---|
 | `/help` | 帮助 |
-| `/pwd` | 当前目录（在常驻 pwsh 中执行） |
-| `/cd <路径>` | 切换目录 |
+| `/pwd` | 当前工作目录 |
+| `/cd <路径>` | 切换目录（相对路径基于当前目录） |
 | `/ls` | 列出文件 |
-| `/ps <命令>` | 执行任意 PowerShell 命令 |
-| `/clear` | 清空 |
 | `/new` | 新 Claude 会话（目录保留） |
 | `/stop` | 取消当前任务 |
-| `/status` | 运行时间、shell、会话信息 |
+| `/status` | 运行时间、工作目录、会话信息 |
 | `/model [名称]` | 查看/切换模型 |
-| `ps <命令>` | 执行任意 PowerShell 命令 |
 | 其他任意文本 | 作为提示词发给 Claude |
 
 群聊需要 @机器人 才会响应（`group_mode: mention-all`）。
 
 ## 与参考实现的差异
 
-参考项目 22000+ 行 Python，本实现刻意省略了：
+参考项目 20000+ 行 Python，本实现刻意省略了：
 
 - **后台任务**（`bg_supervisor` / `bg_tasks.db` / wake socket）— 需要独立的
   reconciler 进程，不是核心交互路径
 - **配额控制**（`quota.py`）— 依赖飞书计费 API
-- **多 runtime**（`runtime_pi` / `runtime_omp` / `runtime_omp`）— 只保留 claude/codex
+- **多 runtime**（`runtime_pi` / `runtime_omp`）— 只保留 claude/codex
 - **session journal / resume index**（`session_journal.py` / `session_resume.py`）
   — 直接用 `--resume`，不做本地索引
 - **memory 注入**（`compact-context.md` / `MEMORY.md` 解析）
 - **消息去重 TTL**（`MessageDedup`）
 - **合并转发展开**（`merge_forward` 需要额外的批量 GET API）
 - **图片/文件消息**（只处理 `text` 与 `interactive`）
+- **常驻 shell 进程**（用 `os.ReadDir` 替代，见架构说明）
 
 保留的核心行为：
 
@@ -240,14 +229,14 @@ feishubridge -config ~/.config/feishu-bridge/config.json -loglevel debug
 cmd/feishubridge/main.go        入口
 internal/config/                配置加载与校验
 internal/feishu/                飞书 SDK 封装（WS / 发消息 / 卡片 / 回调）
-internal/shell/                 常驻 pwsh 会话 + 请求响应协议
 internal/agent/                 claude -p 调用 + stream-json 解析
 internal/card/                  卡片构建（流式 + 交互按钮）
-internal/bridge/                组装层：消息路由、命令、会话管理
+internal/bridge/                组装层：消息路由、命令、会话管理、工作目录
 ```
 
-## 未验证
+## 已验证
 
-本机未安装 Go 工具链，代码**未经编译验证**。SDK API 名称（尤其
-`larksuite/oapi-sdk-go/v3` 的 builder 方法与 `larkws` option 名）需在首次
-`go mod tidy && go build` 时校准。
+- `gofmt` / `go vet` / `go test ./...` 通过
+- 飞书端到端：`/pwd`、`/cd`（含相对路径与不存在路径报错）、`/ls`、
+  `/status`、`/help` 均验证
+- 卡片 schema 2.0 按钮渲染验证（不再触发 ErrCode 200861）

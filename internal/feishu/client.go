@@ -217,9 +217,23 @@ func (c *Client) SendText(ctx context.Context, chatID, text string) (string, err
 // ReplyCard replies to a specific message with a card, threading when asked.
 // This is the only supported way to post into a topic/thread.
 func (c *Client) ReplyCard(ctx context.Context, sourceMessageID string, card map[string]any, thread bool) (string, error) {
+	id, _, err := c.replyCard(ctx, sourceMessageID, card, thread)
+	return id, err
+}
+
+// ReplyCardThreaded is ReplyCard plus the thread id the reply landed in.
+//
+// Feishu has no "create topic" endpoint: a topic comes into existence the
+// moment a message is posted with reply_in_thread=true, and that message is
+// its root. This is what /new uses to start a fresh topic.
+func (c *Client) ReplyCardThreaded(ctx context.Context, sourceMessageID string, card map[string]any, thread bool) (messageID, threadID string, err error) {
+	return c.replyCard(ctx, sourceMessageID, card, thread)
+}
+
+func (c *Client) replyCard(ctx context.Context, sourceMessageID string, card map[string]any, thread bool) (string, string, error) {
 	body, err := json.Marshal(card)
 	if err != nil {
-		return "", fmt.Errorf("marshal card: %w", err)
+		return "", "", fmt.Errorf("marshal card: %w", err)
 	}
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(sourceMessageID).
@@ -231,12 +245,15 @@ func (c *Client) ReplyCard(ctx context.Context, sourceMessageID string, card map
 		Build()
 	resp, err := c.lark.Im.V1.Message.Reply(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("reply message: %w", err)
+		return "", "", fmt.Errorf("reply message: %w", err)
 	}
 	if !resp.Success() {
-		return "", fmt.Errorf("reply message: code=%d msg=%s", resp.Code, resp.Msg)
+		return "", "", fmt.Errorf("reply message: code=%d msg=%s", resp.Code, resp.Msg)
 	}
-	return strval(resp.Data.MessageId), nil
+	if resp.Data == nil {
+		return "", "", nil
+	}
+	return strval(resp.Data.MessageId), strval(resp.Data.ThreadId), nil
 }
 
 // ReplyText replies to a message with plain text.

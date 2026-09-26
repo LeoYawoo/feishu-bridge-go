@@ -193,10 +193,14 @@ func (b *Bridge) handleCommand(ctx context.Context, bot *config.BotConfig, m *fe
 		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, b.currentCwd(bot, m),
 			"```\n"+out+"\n```", standardButtons(bot, m)...))
 	case "/new", "/reset":
-		b.resetSession(bot.ID, m.ChatID, m.ThreadID)
-		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "新会话", "已开启新的 Claude 会话。"))
+		return b.newTopic(ctx, bot, m)
 	case "/stop", "/cancel":
-		b.stopCurrent(bot.ID, m.ChatID, m.ThreadID)
+		if !b.stopCurrent(bot.ID, m.ChatID, m.ThreadID) {
+			// Nothing running: a "已停止" reply would claim an action that did
+			// not happen, and the card the user clicked already shows the
+			// result. Silent is the honest answer here.
+			return nil
+		}
 		return b.replyCard(ctx, m, card.CommandCard(bot.DisplayName, "已停止", "已请求取消当前任务。"))
 	case "/status":
 		return b.handleStatus(ctx, bot, m)
@@ -472,18 +476,67 @@ func (b *Bridge) sendReject(ctx context.Context, chatID, messageID string) {
 	b.cli.SendCard(ctx, chatID, c)
 }
 
-func (b *Bridge) resetSession(botID, chatID, threadID string) {
-	b.store.Delete(botID, chatID, threadID)
-	b.store.Save()
+// newTopic starts a fresh Claude session by starting a fresh Feishu topic.
+//
+// The user-visible object is the topic, not the session id: a "new session"
+// that keeps the old topic would be invisible, since every card in it still
+// shows the old thread. Posting a message with reply_in_thread=true creates a
+// topic whose root is that message, so replies afterwards land there.
+func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.Message) error {
+	if m.MessageID == "" {
+		// Without a message to reply to we cannot post into the chat at all.
+		b.log.Printf("new topic: no source message_id (chat=%s)", shortKey(m.ChatID))
+		return nil
+	}
+
+	had := b.resetSession(bot.ID, m.ChatID, m.ThreadID)
+
+	// A threaded reply must target a root message. m.ThreadID is the thread's
+	// own id, not a message, so the clicked message is the right anchor.
+	root := m.MessageID
+
+	notice := "🆕 新会话已开启。在这个话题里继续，就是一条全新的 Claude 会话；工作目录保持不变。"
+	if !had {
+		notice = "本话题已开启新会话，下一条消息从头开始。工作目录保持不变。"
+	}
+	c := card.CommandCard(bot.DisplayName, "新会话", notice, standardButtons(bot, m)...)
+
+	_, threadID, err := b.cli.ReplyCardThreaded(ctx, root, c, true)
+	if err != nil || threadID == "" {
+		// Not every chat supports topics; a plain reply is correct there.
+		if err != nil {
+			b.log.Printf("new topic: threaded reply failed, replying inline: %v", err)
+		}
+		fallback := card.CommandCard(bot.DisplayName, "新会话", "当前没有旧会话，下一条消息会开启新会话。")
+		return b.replyCard(ctx, m, fallback)
+	}
+
+	b.log.Printf("new topic: %s in chat %s (cleared=%v)", shortID(threadID), shortKey(m.ChatID), had)
+	return nil
 }
 
-func (b *Bridge) stopCurrent(botID, chatID, threadID string) {
+// resetSession drops the thread's session record and reports whether there
+// was one to drop, so a reply can say whether it actually cleared anything.
+func (b *Bridge) resetSession(botID, chatID, threadID string) bool {
+	had := b.store.Get(botID, chatID, threadID) != nil
+	b.store.Delete(botID, chatID, threadID)
+	b.store.Save()
+	return had
+}
+
+// stopCurrent cancels the in-flight turn for this thread. It reports whether
+// anything was running so the caller does not claim to have stopped a task
+// that was not started.
+func (b *Bridge) stopCurrent(botID, chatID, threadID string) bool {
 	key := sessionKey(botID, chatID, threadID)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if t, ok := b.inflight[key]; ok && t.Cancel != nil {
 		t.Cancel()
+		delete(b.inflight, key)
+		return true
 	}
+	return false
 }
 
 // groupGate decides whether a group message should be handled.
@@ -585,6 +638,7 @@ func (b *Bridge) onCardAction(ctx context.Context, req *feishu.CardAction) (*fei
 
 	// No Toast here: handleCommand already replies with a card, so a second
 	// piece of feedback for the same click would be noise.
+	b.log.Printf("card action %q from %s (chat=%s)", action, shortID(req.Operator), shortKey(req.ChatID))
 	switch action {
 	case "", "help":
 		return &feishu.CardResponse{}, b.handleCommand(ctx, bot, msg, "/help")

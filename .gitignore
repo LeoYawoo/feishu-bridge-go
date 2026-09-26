@@ -6,6 +6,9 @@
 *.out
 /dist/
 
+# runtime logs (may contain ephemeral access_key / ticket values)
+*.log
+
 # local-only build scripts (paths are machine-specific)
 build.bat
 

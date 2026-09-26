@@ -116,11 +116,12 @@ func (b *Builder) Build() map[string]any {
 		})
 	}
 
-	if len(b.buttons) > 0 {
-		elements = append(elements, map[string]any{
-			"tag":     "action",
-			"actions": buildActions(b.buttons, b.cardID),
-		})
+	// Card schema 2.0 has no "action" element: each button is its own
+	// top-level element with tag "button". Wrapping them in "action"/"actions"
+	// (the schema-1.0 shape) is rejected with ErrCode 200861
+	// "unsupported tag action".
+	for _, el := range buildActions(b.buttons, b.cardID) {
+		elements = append(elements, el)
 	}
 
 	if b.footer != "" {

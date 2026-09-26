@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -83,9 +82,6 @@ type Client struct {
 
 	handler *EventHandlers
 
-	mu        sync.Mutex
-	botOpenID string
-
 	startupMS int64
 }
 
@@ -125,24 +121,6 @@ func (c *Client) Lark() *lark.Client { return c.lark }
 func (c *Client) AppID() string { return c.appID }
 
 func (c *Client) L() *log.Logger { return c.log }
-
-// SetBotOpenID seeds the bot's own open_id so group gates can match @-mentions.
-// The SDK ships no bot-self endpoint, so this must come from config: send the
-// bot a DM once, note the `open_id` in the logs, and fill it in.
-func (c *Client) SetBotOpenID(openID string) {
-	if openID != "" {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.botOpenID = openID
-	}
-}
-
-// BotOpenID returns the configured bot open_id, or "" if not set.
-func (c *Client) BotOpenID() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.botOpenID
-}
 
 // SetHandlers installs the inbound event callbacks. Must be called before
 // StartWS; handlers are set once at construction and never replaced, so no

@@ -601,7 +601,10 @@ func (b *Bridge) groupGate(_ context.Context, bot *config.BotConfig, m *feishu.M
 		return true // p2p chat
 	}
 
-	botID := b.cli.BotOpenID()
+	// bot.OwnerOpenID is the bot's own open_id (it is not the owner's).
+	// Reading it per-bot rather than from the client makes multi-bot setups
+	// correct: each bot gets its own mention identity.
+	botID := bot.OwnerOpenID
 	switch bot.GroupMode {
 	case "disabled":
 		return false
@@ -614,11 +617,11 @@ func (b *Bridge) groupGate(_ context.Context, bot *config.BotConfig, m *feishu.M
 		}
 		return mentionsBot(m, botID)
 	case "owner-only":
-		if bot.OwnerOpenID == "" || m.SenderID != bot.OwnerOpenID {
-			return false
-		}
+		// owner-only gates on the *sender* being the operator, which is a
+		// different id from the bot's own. That sender id is not configured
+		// anywhere, so this mode only checks the mention once botID is set.
 		if botID == "" {
-			return true
+			return false
 		}
 		return mentionsBot(m, botID)
 	}

@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        go: ['1.22.x', '1.26.x']
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Tidy
+        run: go mod tidy
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build -o feishubridge ./cmd/feishubridge
+
+      - name: Upload binary
+        if: matrix.go == '1.26.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: feishubridge-${{ matrix.os }}-go${{ matrix.go }}
+          path: feishubridge*

@@ -1,0 +1,17 @@
+# build artifacts
+/feishubridge
+/feishubridge.exe
+*.exe
+*.test
+*.out
+
+# editor / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# secrets
+.env
+config.json
+feishu-bridge/

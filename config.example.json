@@ -1,0 +1,34 @@
+{
+  "app_id": "${FEISHU_APP_ID}",
+  "app_secret": "${FEISHU_APP_SECRET}",
+  "domain": "feishu",
+  "default_workspace": "D:\\workcode",
+  "agent": {
+    "command": "claude",
+    "model": "",
+    "timeout_seconds": 300,
+    "silent_timeout_seconds": 480,
+    "append_system_prompt": "你在通过飞书与用户交互。输出会被渲染成飞书卡片。保持回复简洁；长内容请写文件而不是刷屏。"
+  },
+  "bots": [
+    {
+      "id": "main",
+      "display_name": "Bridge",
+      "workspace": "D:\\workcode",
+      "shell": "pwsh",
+      "allowed_users": ["*"],
+      "group_mode": "mention-all",
+      "owner_open_id": "${FEISHU_BOT_OPEN_ID}"
+    }
+  ],
+  "bot_chats": {
+    "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": "main"
+  },
+  "streaming": {
+    "throttle_ms": 800,
+    "max_card_bytes": 28672,
+    "max_div_chars": 10000,
+    "shell_idle_seconds": 1800,
+    "session_idle_seconds": 604800
+  }
+}

@@ -54,6 +54,12 @@ func recentDirButtons(bot *config.BotConfig, cwds []string) []card.Button {
 	if len(cwds) == 0 {
 		return nil
 	}
+	// Defensive: Feishu cards cap visible buttons around 5-6. Even though
+	// recentDirsStore enforces recentDirsMax, don't rely on the caller
+	// honouring it — the constructor is the last gate before pixels.
+	if len(cwds) > recentDirsMax {
+		cwds = cwds[:recentDirsMax]
+	}
 	out := make([]card.Button, 0, len(cwds))
 	for i, cwd := range cwds {
 		label := filepath.Base(cwd)

@@ -2,42 +2,39 @@
 
 基于飞书 Golang SDK 的消息桥接：**飞书 WebSocket → Claude Code**。
 
-在飞书里就能查看/切换工作目录、运行 `claude` / `codex`，并通过飞书消息与会话
-交互。卡片流式更新（打字机效果），底部带交互按钮。
+在飞书里运行 `claude` / `codex`,通过飞书消息与会话交互。卡片流式更新
+(打字机效果),底部带交互按钮。
 
-参考实现: `feishu-bridge/`（Python 版）。本实现只保留核心路径，
-约 1200 行 Go，无 cgo 依赖。
+参考实现: `feishu-bridge/`(Python 版)。本实现只保留核心路径,
+约 1000 行 Go,无 cgo 依赖。
 
 ## 架构
 
-两层状态：
+**心智模型**: 主会话 = 会话管理控制台,话题 = claude 会话。
 
 ```
-飞书消息（chat + thread 话题）
-        │
-        ▼
-┌─────────────────────────────┐
-│ Layer 1: 工作目录             │  ← 每个 chat 一个
-│   /pwd /cd /ls              │     纯 Go 内存记录，不起进程
-└──────────────┬──────────────┘
-               │ 继承当前 cwd
-               ▼
-┌─────────────────────────────┐
-│ Layer 2: Claude Code 会话     │  ← 每个 chat+thread 一个
-│   claude -p --resume <id>   │     JSON 流式输出
-│   保留 CLAUDE.md / hooks /   │     --resume 续接同一会话
-│   skills（同一 claude 二进制） │
-└─────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│ 主会话 (chat 顶层)                                     │
+│   /new [cwd?]  ← 唯一命令                             │
+│   普通消息 → 控制台卡片(5 个"最近目录"按钮)              │
+└──────────────────────┬──────────────────────────────┘
+                       │ /new → 开新话题
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ 话题 (thread) = claude 会话                           │
+│   cwd 创建时定死,不可改                                │
+│   话题根卡片: 5 个历史 session 按钮 + [🆕 新]           │
+│   普通消息 → claude 回复(卡片无按钮)                    │
+│   claude -p --resume <id>                             │
+└─────────────────────────────────────────────────────┘
 ```
 
-飞书「话题（thread）」→ Claude 会话；飞书「聊天（chat）」→ 工作目录。
-私聊没有 thread，退化为一个会话。
+**没有文字命令的话题**: 想中断/切 session,走卡片按钮或跟 claude 说。
+飞书端不再解释 claude 的 `/exit` `/compact` 等内置命令,直接转发。
 
-**为什么不起 shell 进程**：`/pwd`、`/cd`、`/ls` 就是 `os.Getwd` / `os.ReadDir`，
-标准库一行搞定。早期版本每个 chat 起一个常驻 `pwsh` 来跑 `Get-Location`
-和 `Get-ChildItem`，代价是要求 `pwsh` 在 PATH 上、400 行进程管理代码、
-每 30 分钟回收一次的 reaper，还引入一个跨 arch 不成立的外部依赖。现在
-cwd 只是内存里的一个字符串，跨平台天然成立。
+**为什么不需要 shell 进程**: cwd 现在是 `session.Cwd` 字段(持久化到
+`.feishu-bridge-sessions.json`),跨平台天然成立。早期版本 `/pwd` `/cd`
+`/ls` 是常驻 `pwsh` 进程,现在全部砍掉 —— 主会话只做会话管理,不做文件浏览。
 
 ## 前置条件
 
@@ -148,24 +145,29 @@ open_id；或者在飞书开放平台的"凭证与基础信息"页查。
 
 ### 卡片按钮
 
-结果卡片底部有「新会话 / 停止 / 状态 / 帮助」四个按钮，点击等价于输入对应
-命令，并且只在被点击人通过 `allowed_users` 校验时才生效。
+结果卡片底部有交互按钮,点击等价于输入对应命令,并且只在被点击人通过
+`allowed_users` 校验时才生效。主会话卡片是"最近目录"按钮(点击=用该 cwd
+开新话题),话题根卡片是"历史 session"按钮 + `[🆕 新]`(点击=设置 pending,
+下一条消息续/新建 session)。
 
-### 工作目录
+### cwd 生命周期
 
-`/cd` 记录的目录只存在进程内存里，**bridge 重启后回到默认 workspace**。
-这是取舍：进程内的状态重启必然丢失，而持久化它需要一套写入/恢复/校验的
-代码，对一个目录值来说不值当。Claude 会话记录有持久化（见下），因为
-`session_id` 的价值高得多。
+cwd 现在是 session 的属性(`session.Cwd`),持久化到 `.feishu-bridge-sessions.json`
+(见下)。话题创建后 cwd 不可变 —— 想换 cwd 只能回主会话开新话题。
 
 ### Claude 会话持久化
 
 `session_id` ↔ 飞书话题的映射写在 `<workspace>/.feishu-bridge-sessions.json`，
-每条记录带 `bot_id`、`chat_id`、`thread_id`、`last_seen`、`turns`。
+每条记录带 `bot_id`、`chat_id`、`thread_id`、`cwd`、`last_seen`、`turns`。
 
-- **重启后能接回旧会话**。这是唯一的持久化收益：bridge 重启后，同一个话题
-  发的第一条消息会用 `--resume` 续上之前的 Claude 上下文，而不是从头开始。
-- 文件损坏不会阻断启动——映射丢失，但 Claude 自己的 transcript 文件还在磁盘上。
+- **重启后能接回旧会话**。bridge 重启后,同一个话题发的第一条消息会用
+  `--resume` 续上之前的 Claude 上下文,而不是从头开始。
+- **cwd 是 session 的属性**。想恢复某个 cwd 下的历史 session,主会话点控制台
+  卡片上的 `🆕 <dir>` 按钮,新话题根卡片就会列出该 cwd 下的最近 5 个 session。
+- 文件损坏不会阻断启动——映射丢失,但 Claude 自己的 transcript 文件还在磁盘上。
+
+**另外持久化** `<workspace>/.feishu-bridge-recent-dirs.json`: bot 级"最近
+使用过的 cwd"LRU(最多 5 个),供主会话控制台卡片和 `/new` 无参模式使用。
 - 闲置超过 `session_idle_seconds`（默认 7 天）的记录被 reaper 丢弃，
   Claude 本地的 transcript 不受影响，只是 bridge 不再知道它属于哪个话题。
 - `/new` 删除当前话题的记录；`/status` 显示总会话数。
@@ -184,19 +186,34 @@ feishubridge -config ~/.config/feishu-bridge/config.json -loglevel debug
 
 ## 在飞书里使用
 
-| 命令 | 作用 |
-|---|---|
-| `/help` | 帮助 |
-| `/pwd` | 当前工作目录 |
-| `/cd <路径>` | 切换目录（相对路径基于当前目录） |
-| `/ls` | 列出文件 |
-| `/new` | 新 Claude 会话（目录保留） |
-| `/stop` | 取消当前任务 |
-| `/status` | 运行时间、工作目录、会话信息 |
-| `/model [名称]` | 查看/切换模型 |
-| 其他任意文本 | 作为提示词发给 Claude |
+**心智模型**:
 
-群聊需要 @机器人 才会响应（`group_mode: mention-all`）。
+- **主会话**(chat 顶层)= 会话管理控制台。唯一命令 `/new [cwd?]`。
+  发普通消息收到控制台卡片(带最近目录按钮),不会启动 claude。
+- **话题** = claude 会话。cwd 创建时定死,话题内无文字命令。
+  所有切换/中断走卡片按钮。
+
+| 位置 | 输入 | 结果 |
+|---|---|---|
+| 主会话 | `/new` | 用**最近使用过的目录**(bot 级 LRU)开新话题 |
+| 主会话 | `/new D:\workcode\api` | 用该 cwd 开新话题(不存在的路径报错) |
+| 主会话 | 其他文本 | 收到控制台卡片(5 个以内"最近目录"按钮) |
+| 主会话 · 卡片 | 点 `🆕 api (最近)` | 等效 `/new D:\workcode\api` |
+| 话题根卡片 · 卡片 | 点 `▶ 3b2526fd` | 下一条消息 `--resume 3b2526fd` |
+| 话题根卡片 · 卡片 | 点 `🆕 新` | 下一条消息开新 session(不 resume) |
+| 话题 | 任意文本 | 作为提示词发给 claude(卡片无按钮) |
+
+**卡片按钮 = 命令快捷键**:点击 = 用户在输入框里输入对应命令。按钮不引入新动作。
+
+**没有的**:
+- 话题内**没有**文字命令(`/cd` `/sessions` `/resume` `/stop` `/status` `/help` `/model` 全部砍掉)。
+- **没有** `/cd`。想换 cwd,回主会话开新话题。
+- **没有**运行时切换模型。通过 config 或环境变量固定。
+- **没有**实时列 claude 的 session。话题根卡片只列**本桥接自己创建过**的 session。
+
+群聊需要 @机器人 才会响应(`group_mode: mention-all`)。
+
+**交互设计稿**:见 `docs/feishu-redesign-mockup.png` 和 `docs/design-session-and-test.md`。
 
 ## 与参考实现的差异
 
@@ -237,6 +254,7 @@ internal/bridge/                组装层：消息路由、命令、会话管理
 ## 已验证
 
 - `gofmt` / `go vet` / `go test ./...` 通过
-- 飞书端到端：`/pwd`、`/cd`（含相对路径与不存在路径报错）、`/ls`、
-  `/status`、`/help` 均验证
-- 卡片 schema 2.0 按钮渲染验证（不再触发 ErrCode 200861）
+- 单元测试: `recentDirsStore` 9 个用例(增/查/持久化/损坏文件恢复/多 bot 隔离)
+- 飞书端到端待重跑(交互重设计后,原 `/pwd` `/cd` `/ls` `/status` `/help`
+  用例已不适用,新用例 E1-E8 见 `docs/design-session-and-test.md` §6.3)
+- 卡片 schema 2.0 按钮渲染验证(不再触发 ErrCode 200861)

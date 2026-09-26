@@ -1,10 +1,10 @@
-// Package bridge wires the Feishu client, the per-chat working directory and
-// the Claude Code agent together.
+// Package bridge wires the Feishu client, the topic-scoped working directory
+// and the Claude Code agent together.
 //
-// The directory layer is deliberately small: it remembers a cwd per chat so
-// /cd carries over into later /ls calls and into the agent's working
-// directory. It does not run a shell process, so it needs no external shell
-// binary and builds the same on every architecture.
+// Main chat is a session-management console (/new only); topics are
+// claude conversations with a cwd fixed at creation time. No shell
+// process is spawned, so the package needs no external shell binary and
+// builds the same on every architecture.
 package bridge
 
 import (
@@ -102,10 +102,10 @@ type Bridge struct {
 // map key, so a persisted session can be re-hydrated and re-keyed without
 // string surgery.
 type session struct {
-	ID        agent.SessionID
-	BotID     string
-	ChatID    string
-	ThreadID  string
+	ID       agent.SessionID
+	BotID    string
+	ChatID   string
+	ThreadID string
 	// Cwd is the working directory the session was created in. It is written
 	// once when the session is first materialised and never mutated; /cd is
 	// gone, so a topic's cwd is fixed for its lifetime. Persisted so a

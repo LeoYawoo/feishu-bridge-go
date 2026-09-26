@@ -1,0 +1,24 @@
+# Force LF for every tracked file. actions/checkout defaults to
+# core.autocrlf=true on Windows runners, which materialises Go sources as
+# CRLF. gofmt wants LF-only, so the gofmt -l step then reports every .go
+# file as unformatted. Pinning text=auto here overrides the local config.
+* text=auto
+
+# Go sources are the strictest case: gofmt compares byte-for-byte, so they
+# must never be rewritten at checkout.
+*.go text eol=lf
+
+# Explicit text so line endings are normalised even for files with no other
+# hint.
+*.md text
+*.yml text
+*.yaml text
+*.json text
+*.mod text
+*.sum text
+*.bat text eol=crlf
+
+# Local-only build scripts and data. eol=crlf keeps the committed
+# build.bat double-quoted cmd syntax working if it is ever tracked.
+Makefile text
+config.example.json text eol=lf

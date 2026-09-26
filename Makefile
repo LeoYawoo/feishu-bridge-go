@@ -50,7 +50,7 @@ PLATFORMS := \
 
 # Split a "goos/goarch" pair. make has no built-in split, so use two vars set
 # by the caller. Avoids shell $() expansion, which mingw32-make cannot run.
-.PHONY: all build test vet fmt tidy clean release release-windows release-linux
+.PHONY: all build test vet fmt tidy clean release release-windows release-linux e2e
 .DEFAULT_GOAL := help
 
 help:
@@ -64,6 +64,7 @@ help:
 	@echo "  make vet        go vet"
 	@echo "  make fmt        gofmt -w"
 	@echo "  make tidy       go mod tidy"
+	@echo "  make e2e        open the e2e manual (docs/e2e.md)"
 	@echo "  make clean      remove binaries and dist/"
 	@echo ""
 	@echo "Variables: VERSION=v1.2.3 GO=your-go GOMODCACHE=/path/to/cache"
@@ -88,6 +89,22 @@ fmt:
 
 tidy:
 	$(GO) mod tidy
+
+## Open the e2e manual.
+## The e2e scenarios are by design not automatable: they require a real
+## feishu client, a real claude subprocess, and human eyes on the card
+## rendering. `make e2e` just points at the doc; the actual test is a
+## human walk-through.
+##
+## The doc itself is a checklist — read top to bottom, each step says
+## what to send and what to expect. When the interaction changes,
+## update docs/e2e.md in the same commit as the code.
+e2e:
+	@echo "==> e2e manual: docs/e2e.md"
+	@echo ""
+	@sed -n '1,10p' docs/e2e.md
+	@echo "..."
+	@echo "(full content in docs/e2e.md; open it in an editor)"
 
 clean:
 	rm -rf $(DIST)

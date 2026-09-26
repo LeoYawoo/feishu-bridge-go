@@ -254,7 +254,11 @@ internal/bridge/                组装层：消息路由、命令、会话管理
 ## 已验证
 
 - `gofmt` / `go vet` / `go test ./...` 通过
-- 单元测试: `recentDirsStore` 9 个用例(增/查/持久化/损坏文件恢复/多 bot 隔离)
-- 飞书端到端待重跑(交互重设计后,原 `/pwd` `/cd` `/ls` `/status` `/help`
-  用例已不适用,新用例 E1-E8 见 `docs/design-session-and-test.md` §6.3)
+- 第 1 层单元测试: `recentDirsStore` 9 个、`isBridgeCommand`/`parseNewArgs`/
+  `recentDirButtons`/`topicRootButtons` 27 个、`parseMS`/`stripMentionKeys`/
+  `extractCardText` 11 个
+- 第 2 层集成测试: 9 个场景覆盖主聊天/话题路由、`/new` 全路径、
+  `onCardAction` 三分支、session.Cwd 权威性、LRU 提升
+- 第 3 层 e2e: `docs/e2e.md` E1-E8 手工用例(`make e2e` 打开)。
+  改交互、改卡片、改持久化、改 `internal/agent/` 之后要过一遍
 - 卡片 schema 2.0 按钮渲染验证(不再触发 ErrCode 200861)

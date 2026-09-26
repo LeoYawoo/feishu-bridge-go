@@ -110,6 +110,24 @@ type Bridge struct {
 	topicCwdMu sync.Mutex
 	topicCwd   map[string]string
 
+	// seenMessageIDs dedupes inbound messages. The feishu ws gateway
+	// re-delivers any message whose ack we haven't flushed in time, so the
+	// same MessageID can show up twice within seconds. Without this the
+	// bridge would runTurn twice for one user input, which shows up in
+	// feishu as "Bridge replied twice" and burns two claude invocations.
+	//
+	// Entries expire so a long-lived bridge doesn't grow the map without
+	// bound. 5 minutes is far longer than the ws retransmit window (which
+	// is on the order of seconds) but short enough that a few hundred
+	// entries per hour tops out around a couple thousand.
+	//
+	// Guarded by seenMu. Separate from inflightMu because the dedup check
+	// is on the message path (very frequent) and inflight is turn-scoped
+	// (much rarer); sharing the lock would serialise unrelated work.
+	seenMu         sync.Mutex
+	seenMessageIDs map[string]time.Time
+	seenMessageTTL time.Duration
+
 	startedAt time.Time
 }
 
@@ -152,6 +170,8 @@ func New(cfg *config.Config, cli *feishu.Client, logger *log.Logger) *Bridge {
 		inflight:        make(map[string]*turn),
 		pendingSessions: make(map[string]string),
 		topicCwd:        make(map[string]string),
+		seenMessageIDs:  make(map[string]time.Time),
+		seenMessageTTL:  5 * time.Minute,
 		runAgent:        realAgentRunner{},
 	}
 	b.store = newSessionStore(cfg.Bots[0].Workspace, logger.Printf)
@@ -207,6 +227,16 @@ func (b *Bridge) stopIdleSessions(ctx context.Context, keys []string) {
 func (b *Bridge) onMessage(ctx context.Context, m *feishu.Message) error {
 	if m.SenderType == "app" {
 		return nil // ignore ourselves
+	}
+	// The feishu ws gateway re-delivers messages whose ack didn't get
+	// flushed in time. The same MessageID shows up twice within seconds;
+	// without this we'd runTurn twice per user input and the user would
+	// see Bridge reply twice. Claiming is the whole dedup: first call
+	// wins, subsequent calls within the TTL silently drop.
+	if !b.claimMessage(m.MessageID) {
+		b.log.Printf("duplicate %s chat=%s thread=%q (ws redelivery)",
+			shortID(m.MessageID), shortID(m.ChatID), m.ThreadID)
+		return nil
 	}
 
 	bot := resolveBot(b.cfg, b.log, m.ChatID)
@@ -310,6 +340,33 @@ func (b *Bridge) lookupTopicCwd(threadID string) string {
 	b.topicCwdMu.Lock()
 	defer b.topicCwdMu.Unlock()
 	return b.topicCwd[threadID]
+}
+
+// claimMessage records a MessageID and returns true the first time it's
+// seen within the TTL. Subsequent calls return false so a ws redelivery
+// doesn't re-trigger a turn. A single sweep of stale entries runs on
+// every call — cheap enough for one user's message rate, and avoids
+// spinning up a dedicated reaper goroutine for a map that only ever
+// holds a handful of IDs.
+func (b *Bridge) claimMessage(messageID string) bool {
+	if messageID == "" {
+		// Card actions and other non-message paths call this indirectly;
+		// guard against panics on an empty key.
+		return true
+	}
+	b.seenMu.Lock()
+	defer b.seenMu.Unlock()
+	now := time.Now()
+	for id, ts := range b.seenMessageIDs {
+		if now.Sub(ts) > b.seenMessageTTL {
+			delete(b.seenMessageIDs, id)
+		}
+	}
+	if _, seen := b.seenMessageIDs[messageID]; seen {
+		return false
+	}
+	b.seenMessageIDs[messageID] = now
+	return true
 }
 
 // ---- the turn ------------------------------------------------------------
@@ -420,6 +477,8 @@ func (b *Bridge) runTurn(ctx context.Context, bot *config.BotConfig, m *feishu.M
 	// latestEv is captured so an interrupted turn still reports what it got.
 	var latestEv agent.Event
 
+	b.log.Printf("agent.run chat=%s thread=%q cwd=%q resume=%q prompt=%.60q",
+		m.ChatID, m.ThreadID, workspace, resume, text)
 	started := time.Now()
 	res, err := b.runAgent.Run(turnCtx, cfg, text, agent.SessionID(resume), func(ev agent.Event) {
 		latestEv = ev

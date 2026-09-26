@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"feishubridge/internal/agent"
 	"feishubridge/internal/config"
@@ -144,6 +145,8 @@ func newTestBridge(t *testing.T) (*Bridge, *fakeSender, *agentStub) {
 		inflight:        make(map[string]*turn),
 		pendingSessions: make(map[string]string),
 		topicCwd:        make(map[string]string),
+		seenMessageIDs:  make(map[string]time.Time),
+		seenMessageTTL:  5 * time.Minute,
 		runAgent:        as,
 	}
 	return b, fs, as
@@ -463,6 +466,49 @@ func TestFirstTurnUsesTopicCwd(t *testing.T) {
 	if as.cfgs[0].Workspace != work {
 		t.Errorf("agent workspace = %q, want %q (topic cwd, not bot workspace)",
 			as.cfgs[0].Workspace, work)
+	}
+}
+
+// TestDuplicateMessageID_IsDropped verifies that a ws redelivery of the
+// same MessageID does not trigger a second agent.Run. The feishu gateway
+// re-delivers messages whose ack didn't get flushed in time; without
+// this the user sees Bridge reply twice and the bridge burns two
+// claude invocations on the same input.
+func TestDuplicateMessageID_IsDropped(t *testing.T) {
+	b, _, as := newTestBridge(t)
+	ctx := context.Background()
+
+	msg := &feishu.Message{
+		ChatID:    "oc_1",
+		ThreadID:  "omt_1",
+		MessageID: "om_dup",
+		RawText:   "hello",
+	}
+	_ = b.onMessage(ctx, msg)
+	_ = b.onMessage(ctx, msg)
+
+	if len(as.prompts) != 1 {
+		t.Fatalf("agent invoked %d times for duplicate MessageID; want 1",
+			len(as.prompts))
+	}
+}
+
+// TestDifferentMessageIDs_BothRun verifies dedup only kicks in for
+// identical MessageIDs, not for every message in a topic.
+func TestDifferentMessageIDs_BothRun(t *testing.T) {
+	b, _, as := newTestBridge(t)
+	ctx := context.Background()
+
+	_ = b.onMessage(ctx, &feishu.Message{
+		ChatID: "oc_1", ThreadID: "omt_1", MessageID: "om_a", RawText: "hi",
+	})
+	_ = b.onMessage(ctx, &feishu.Message{
+		ChatID: "oc_1", ThreadID: "omt_1", MessageID: "om_b", RawText: "again",
+	})
+
+	if len(as.prompts) != 2 {
+		t.Fatalf("agent invoked %d times; want 2 (different MessageIDs are not duplicates)",
+			len(as.prompts))
 	}
 }
 

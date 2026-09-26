@@ -35,6 +35,10 @@ type Bridge struct {
 	cwds       map[string]string
 	store      *sessionStore
 	sessReaper *reaper
+	// recentDirs is the bot-level LRU of recently opened cwds, persisted
+	// next to the session table. The console card reads it (step 9); newTopic
+	// pushes into it now so the LRU is populated as soon as /new lands.
+	recentDirs *recentDirsStore
 	// inflight tracks turns currently running, so /stop can cancel them.
 	inflight map[string]*turn
 
@@ -76,6 +80,7 @@ func New(cfg *config.Config, cli *feishu.Client, logger *log.Logger) *Bridge {
 	}
 	b.store = newSessionStore(cfg.Bots[0].Workspace, logger.Printf)
 	b.sessReaper = newReaper(cfg.Stream.SessionIdleSec, logger.Printf)
+	b.recentDirs = newRecentDirsStore(cfg.Bots[0].Workspace, logger.Printf)
 
 	cli.SetHandlers(&feishu.EventHandlers{
 		OnMessage:    b.onMessage,
@@ -552,6 +557,10 @@ func (b *Bridge) newTopic(ctx context.Context, bot *config.BotConfig, m *feishu.
 	// Now that the topic exists, show what it is bound to. The notice card
 	// is the topic's root, so it gets the topic-scoped button set.
 	b.setCwd(bot.ID, m.ChatID, threadID, inherit)
+	// Promote this cwd in the bot-level LRU so a future no-arg /new and the
+	// console card can find it. Only after the topic is real: an inherited
+	// cwd that never materialises into a topic is not "recently used".
+	b.recentDirs.Add(bot.ID, inherit)
 
 	notice := card.CommandCard(bot.DisplayName, "新会话",
 		body+"\n\n"+threadContext(nil, inherit), threadButtons(threadID, msgID)...)
